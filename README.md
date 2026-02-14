@@ -10,7 +10,13 @@
 - 对话流式输出（含推理内容分区展示）
 - Function Calling 循环执行（多轮工具调用）
 - 页面操作工具（抓取 DOM、改属性、改文本、整页替换等）
+- 本地存储工具（`set_storage` / `get_storage`）
 - MCP 多服务配置（可独立启用/关闭）
+
+## 近期变更
+
+- 已移除抓包相关功能（`start_network_capture` / `get_network_capture` / `stop_network_capture`）。
+- SSE MCP 链路已支持按 JSON-RPC `id` 对齐响应，兼容 `POST` 空响应体场景。
 
 ## 内置网页工具
 
@@ -25,9 +31,6 @@
 - `set_html`
 - `set_attribute`
 - `remove_elements`
-- `start_network_capture`（拦截当前页 fetch/xhr 请求与响应）
-- `get_network_capture`（读取抓包日志）
-- `stop_network_capture`（停止抓包）
 - `set_storage`（按 key 持久化存储 JSON 值）
 - `get_storage`（按 key 读取存储值）
 - `get_whole_html`
@@ -42,16 +45,6 @@
 `set_storage/get_storage` 示例：  
 - `{"key":"profile","value":{"name":"lhstack","lang":"zh-CN"}}`  
 - `{"key":"profile"}`
-
-`network_capture` 示例：  
-- `{"urlIncludes":"/api","includeBodies":true,"maxEntries":200}`  
-- `{"limit":20,"clear":false}`  
-- `{"clear":true}`
-
-可选加解密转换脚本参数：  
-- `requestTransformCode` / `responseTransformCode`：脚本签名 `(ctx, params) => any`，用于输出转换后的视图。  
-- `transformParams`：传给转换脚本的参数（例如密钥、算法标识）。  
-- `requestRewriteCode`：仅针对 `fetch`，可改写发出的 `url/method/headers/body`。
 
 ## 快速开始
 
@@ -84,7 +77,7 @@ npm run build
 - `stdio`：通过桥接服务启动本地命令
 
 说明：MCP 默认采用独立调用链路（`tools/list` + `tools/call` / streamable HTTP JSON-RPC），不依赖 `responses`。
-提示：SSE 配置建议填 `.../sse`，不要填 `.../sse/tools` 或 `.../sse/call`；若服务本身支持 Streamable HTTP，优先选 `streamable_http`。
+提示：SSE 配置建议填 `.../sse`，不要填 `.../sse/tools` 或 `.../sse/call`；若服务支持 Streamable HTTP，优先选 `streamable_http`。
 
 ### SSE 链路（本次更新）
 
