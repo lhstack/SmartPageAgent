@@ -25,10 +25,33 @@
 - `set_html`
 - `set_attribute`
 - `remove_elements`
+- `start_network_capture`（拦截当前页 fetch/xhr 请求与响应）
+- `get_network_capture`（读取抓包日志）
+- `stop_network_capture`（停止抓包）
+- `set_storage`（按 key 持久化存储 JSON 值）
+- `get_storage`（按 key 读取存储值）
 - `get_whole_html`
 - `replace_whole_html`
 - `translate_whole_page_to_zh`
+- `execute_script`（执行脚本并返回结果，高风险，默认需手动开启）
 - `append_script`（高风险，默认需手动开启）
+
+`execute_script` 建议写法示例：`{"code":"return new Date().toString()"}`  
+如果不写 `return`，插件会尝试回退为表达式求值，但复杂脚本仍建议显式 `return`。
+
+`set_storage/get_storage` 示例：  
+- `{"key":"profile","value":{"name":"lhstack","lang":"zh-CN"}}`  
+- `{"key":"profile"}`
+
+`network_capture` 示例：  
+- `{"urlIncludes":"/api","includeBodies":true,"maxEntries":200}`  
+- `{"limit":20,"clear":false}`  
+- `{"clear":true}`
+
+可选加解密转换脚本参数：  
+- `requestTransformCode` / `responseTransformCode`：脚本签名 `(ctx, params) => any`，用于输出转换后的视图。  
+- `transformParams`：传给转换脚本的参数（例如密钥、算法标识）。  
+- `requestRewriteCode`：仅针对 `fetch`，可改写发出的 `url/method/headers/body`。
 
 ## 快速开始
 
@@ -57,8 +80,18 @@ npm run build
 
 - `streamable_http`：原生 MCP JSON-RPC（推荐）
 - `http`：`/tools + /call` 网关模式
-- `sse`：SSE 桥接模式
+- `sse`：SSE 直连 MCP（推荐填写 `/sse` 端点）；也支持桥接模式
 - `stdio`：通过桥接服务启动本地命令
+
+说明：MCP 默认采用独立调用链路（`tools/list` + `tools/call` / streamable HTTP JSON-RPC），不依赖 `responses`。
+提示：SSE 配置建议填 `.../sse`，不要填 `.../sse/tools` 或 `.../sse/call`；若服务本身支持 Streamable HTTP，优先选 `streamable_http`。
+
+### SSE 链路（本次更新）
+
+- 新增 SSE JSON-RPC `id` 对齐：当 `POST` 仅返回 `202/空体` 时，会继续在 SSE 事件流中按请求 `id` 等待对应结果（避免误判为无返回）。
+- 增加 SSE 会话内 `pending/inbox` 管理，解决握手后响应与请求的竞态问题。
+- 会话清理或流关闭时会主动中止并回收等待中的请求，避免前端“卡住”。
+- 当服务返回 0 个工具时会显示明确提示：`未返回可用工具列表（0 个 tools）`，用于区分“链路问题”和“服务端确实无工具”。
 
 ## 常用开发命令
 
@@ -72,6 +105,6 @@ npm run build:watch
 
 ## 安全提示
 
-- 开启 `append_script` 后，模型可以在页面注入并执行脚本，请仅在可信页面使用。
+- 开启 `execute_script` / `append_script` 后，模型可以在页面执行脚本，请仅在可信页面使用。
 - API Key、MCP Token、MCP 服务配置保存在 `chrome.storage.local`。
 - `chrome://` 等浏览器内部页面无法注入内容脚本。

@@ -517,11 +517,13 @@ function buildMcpServiceCard(service) {
   const isHTTP = service.transport === "http";
   const isStreamableHTTP = service.transport === "streamable_http";
 
-  const baseURLLabel = isHTTP || isStreamableHTTP ? "服务 URL" : "桥接 URL";
+  const baseURLLabel = isSSE ? "SSE 服务 URL" : isHTTP || isStreamableHTTP ? "服务 URL" : "桥接 URL";
   const baseURLHint = isHTTP
     ? "例如：https://mcp-gateway.example.com"
     : isStreamableHTTP
     ? "例如：https://mcp.example.com/mcp"
+    : isSSE
+    ? "优先： https://xxx/sse（直连）; 或桥接： http://127.0.0.1:8787/mcp-bridge"
     : "例如：http://127.0.0.1:8787/mcp-bridge";
   const stdioHiddenClass = isStdio ? "" : "hidden";
 
@@ -529,7 +531,7 @@ function buildMcpServiceCard(service) {
   if (isHTTP) {
     transportNote = "HTTP：兼容 /tools + /call 网关接口。";
   } else if (isSSE) {
-    transportNote = "SSE：通过桥接服务转发。";
+    transportNote = "SSE：支持直连 /sse 端点（推荐）或桥接模式；若服务支持 Streamable HTTP，优先选择 Streamable HTTP。";
   } else if (isStdio) {
     transportNote = "STDIO：通过桥接服务按 command/args/env 启动。";
   }
@@ -555,7 +557,7 @@ function buildMcpServiceCard(service) {
         <select data-field="transport">
           <option value="streamable_http" ${service.transport === "streamable_http" ? "selected" : ""}>Streamable HTTP</option>
           <option value="http" ${service.transport === "http" ? "selected" : ""}>HTTP 网关</option>
-          <option value="sse" ${service.transport === "sse" ? "selected" : ""}>SSE（桥接）</option>
+          <option value="sse" ${service.transport === "sse" ? "selected" : ""}>SSE（直连/桥接）</option>
           <option value="stdio" ${service.transport === "stdio" ? "selected" : ""}>STDIO（桥接）</option>
         </select>
       </label>
