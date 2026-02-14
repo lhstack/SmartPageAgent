@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "智页（SmartPage Agent）",
+  "version": "0.1.0",
+  "description": "通过自然语言智能操作当前网页：整页翻译、提取总结、修改 DOM 属性、批量执行页面操作，并支持 MCP 工具扩展。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://api.openai.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.bundle.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "智页（SmartPage Agent）",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  }
+}

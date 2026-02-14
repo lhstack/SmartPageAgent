@@ -1,0 +1,128 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Web Agent</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="chat-wrap">
+        <div class="chat-topbar">
+          <div class="chat-top-left">
+            <div class="inline-model-row">
+              <span class="tip">模型</span>
+              <input
+                id="quickModelInput"
+                list="modelList"
+                type="search"
+                placeholder="手输或选择模型"
+                autocomplete="off"
+                disabled
+              />
+            </div>
+            <span id="runState" class="tip"></span>
+          </div>
+          <div class="chat-top-actions">
+            <select id="thinkingLevelInput" title="思考级别">
+              <option value="auto">AUTO</option>
+              <option value="low">LOW</option>
+              <option value="medium">MEDIUM</option>
+              <option value="high">HIGH</option>
+              <option value="xhigh">XHIGH</option>
+            </select>
+            <button id="clearBtn" class="ghost-btn">清空</button>
+            <button id="openSettingsBtn" class="icon-btn" title="设置">⚙</button>
+          </div>
+        </div>
+        <div id="chatLog" class="chat-log"></div>
+      </section>
+
+      <section class="composer">
+        <div class="quick-row">
+          <button class="quick-btn" data-q="把当前页面英文翻译成中文">整页翻译</button>
+          <button class="quick-btn" data-q="提取当前页面主要内容并总结成5条">抓取总结</button>
+          <button class="quick-btn" data-q="把页面中所有外链加上 target=_blank">修改属性</button>
+        </div>
+
+        <div class="compose-row">
+          <textarea
+            id="promptInput"
+            rows="3"
+            placeholder="输入你的指令，例如：把页面中所有英文段落翻译成中文"
+          ></textarea>
+          <button id="runBtn" class="send-btn" title="发送">➤</button>
+        </div>
+      </section>
+    </main>
+
+    <div id="settingsModal" class="modal hidden">
+      <section class="settings-card">
+        <header class="settings-head">
+          <h2>连接设置</h2>
+          <button id="closeSettingsBtn" class="icon-btn" title="关闭">✕</button>
+        </header>
+
+        <div class="settings-body">
+          <label>
+            API Key
+            <input id="apiKeyInput" type="password" placeholder="sk-..." autocomplete="off" />
+          </label>
+
+          <label>
+            Base URL
+            <input id="baseUrlInput" type="text" value="https://api.openai.com/v1" autocomplete="off" />
+          </label>
+
+          <section class="model-panel">
+            <div class="mcp-panel-head">
+              <strong>模型设置</strong>
+            </div>
+            <div class="model-select-row">
+              <input
+                id="modelInput"
+                list="modelList"
+                type="search"
+                placeholder="可手输或搜索已获取模型"
+                autocomplete="off"
+                disabled
+              />
+            </div>
+            <div class="tip">模型列表会自动静默刷新，仍可直接手输模型名。</div>
+            <datalist id="modelList"></datalist>
+          </section>
+
+          <section class="mcp-panel">
+            <div class="mcp-panel-head">
+              <strong>MCP 服务</strong>
+              <button id="addMcpServiceBtn" type="button" class="ghost-btn">新增服务</button>
+            </div>
+            <div id="mcpServicesList" class="mcp-services-list"></div>
+            <div class="tip">支持多服务与多传输：`streamable_http`、`http`、`sse`、`stdio`。</div>
+          </section>
+
+          <label class="checkbox-row">
+            <input id="allowScriptInput" type="checkbox" />
+            <span>允许注入 script（高风险）</span>
+          </label>
+
+          <label>
+            请求超时（秒）
+            <input id="requestTimeoutSecInput" type="number" min="5" max="600" step="1" value="120" />
+          </label>
+
+          <label>
+            工具调用轮次上限（0=不限制）
+            <input id="toolTurnLimitInput" type="number" min="0" step="1" value="0" />
+          </label>
+
+          <div class="tip">接口路径由 OpenAI SDK 自动处理，仅需配置 Base URL。</div>
+          <div id="saveStatus" class="tip">设置会自动保存到本地</div>
+        </div>
+      </section>
+    </div>
+
+    <script src="./popup.js" type="module"></script>
+  </body>
+</html>
