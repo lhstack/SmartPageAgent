@@ -13518,6 +13518,39 @@ var MAX_MEMORY_TEXT_CHARS = 1800;
 var mcpRpcSeq = 0;
 var mcpStreamableSessions = {};
 var mcpSSESessions = {};
+function createTaskCancelledError(reason = "\u4EFB\u52A1\u5DF2\u505C\u6B62") {
+  const err = new Error(String(reason || "\u4EFB\u52A1\u5DF2\u505C\u6B62"));
+  err.name = "TaskCancelledError";
+  return err;
+}
+function isTaskCancelledError(err) {
+  if (!err) return false;
+  if (err?.name === "TaskCancelledError") return true;
+  const message = String(err?.message || err || "").toLowerCase();
+  return message.includes("taskcancellederror") || message.includes("\u4EFB\u52A1\u5DF2\u505C\u6B62") || message.includes("aborted") || message.includes("abort");
+}
+function ensureTaskActive(hooks) {
+  if (hooks?.cancelSignal?.aborted) {
+    throw createTaskCancelledError(hooks?.cancelReason || hooks?.cancelSignal?.reason || "\u4EFB\u52A1\u5DF2\u505C\u6B62");
+  }
+}
+function stopRunningTask(reason = "\u7528\u6237\u5DF2\u505C\u6B62\u4EFB\u52A1") {
+  if (!runningTask || runningTask.status !== "running") {
+    return { ok: false, error: "\u5F53\u524D\u6CA1\u6709\u53EF\u505C\u6B62\u7684\u8FD0\u884C\u4EFB\u52A1" };
+  }
+  runningTask.cancelRequested = true;
+  runningTask.cancelReason = String(reason || "\u7528\u6237\u5DF2\u505C\u6B62\u4EFB\u52A1");
+  runningTask.statusText = "\u505C\u6B62\u4E2D...";
+  schedulePersistTaskState(runningTask);
+  broadcastTask(runningTask, { type: "status", text: runningTask.statusText });
+  try {
+    if (runningTask.abortController && !runningTask.abortController.signal.aborted) {
+      runningTask.abortController.abort(runningTask.cancelReason);
+    }
+  } catch (_err) {
+  }
+  return { ok: true, taskId: runningTask.id, status: "stopping" };
+}
 function generateTaskID() {
   return `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -13532,6 +13565,8 @@ function toTaskPublicState(task) {
     reasoningText: task.reasoningText || "",
     message: task.message || "",
     error: task.error || "",
+    cancelRequested: !!task.cancelRequested,
+    cancelReason: task.cancelReason || "",
     startedAt: Number(task.startedAt || 0),
     endedAt: Number(task.endedAt || 0)
   };
@@ -13588,9 +13623,14 @@ async function executeBackgroundTask(task, settings, hooksBuilder) {
   await persistTaskStateNow(task);
   try {
     const hooks = hooksBuilder(task);
+    ensureTaskActive(hooks);
     const result = await runAgent(task.prompt, settings, hooks);
     task.endedAt = Date.now();
-    if (result?.ok) {
+    if (result?.cancelled || task.cancelRequested) {
+      task.status = "stopped";
+      task.message = String(result?.message || task.cancelReason || "\u4EFB\u52A1\u5DF2\u505C\u6B62");
+      broadcastTask(task, { type: "stopped", message: task.message });
+    } else if (result?.ok) {
       task.status = "done";
       task.message = String(result?.message || "\u6267\u884C\u5B8C\u6210");
       broadcastTask(task, { type: "result", message: task.message });
@@ -13601,9 +13641,15 @@ async function executeBackgroundTask(task, settings, hooksBuilder) {
     }
   } catch (err) {
     task.endedAt = Date.now();
-    task.status = "error";
-    task.error = String(err || "\u6267\u884C\u5931\u8D25");
-    broadcastTask(task, { type: "error", error: task.error });
+    if (task.cancelRequested || isTaskCancelledError(err)) {
+      task.status = "stopped";
+      task.message = String(task.cancelReason || "\u4EFB\u52A1\u5DF2\u505C\u6B62");
+      broadcastTask(task, { type: "stopped", message: task.message });
+    } else {
+      task.status = "error";
+      task.error = String(err || "\u6267\u884C\u5931\u8D25");
+      broadcastTask(task, { type: "error", error: task.error });
+    }
   } finally {
     await persistTaskStateNow(task);
     broadcastTask(task, { type: "done" });
@@ -13671,6 +13717,9 @@ chrome.runtime.onConnect.addListener((port) => {
       reasoningText: "",
       message: "",
       error: "",
+      cancelRequested: false,
+      cancelReason: "",
+      abortController: new AbortController(),
       startedAt: Date.now(),
       endedAt: 0,
       subscribers: /* @__PURE__ */ new Set()
@@ -13702,7 +13751,9 @@ chrome.runtime.onConnect.addListener((port) => {
         schedulePersistTaskState(task2);
         broadcastTask(task2, { type: "reasoning_delta", delta: text });
       },
-      onDebug: ENABLE_TRACE_LOGS ? (text) => broadcastTask(task2, { type: "debug", text }) : void 0
+      onDebug: ENABLE_TRACE_LOGS ? (text) => broadcastTask(task2, { type: "debug", text }) : void 0,
+      cancelSignal: task2.abortController?.signal,
+      cancelReason: task2.cancelReason || "\u4EFB\u52A1\u5DF2\u505C\u6B62"
     }));
   });
 });
@@ -15855,8 +15906,40 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = 0) {
     }
   }
 }
+function mergeAbortSignals(...signals) {
+  const list = signals.filter((sig) => sig && typeof sig === "object");
+  if (list.length === 0) return null;
+  if (list.length === 1) return list[0];
+  const controller = new AbortController();
+  const cleanups = [];
+  const abortWith = (reason) => {
+    if (controller.signal.aborted) return;
+    try {
+      controller.abort(reason);
+    } catch (_err) {
+      controller.abort();
+    }
+    for (const off of cleanups) {
+      try {
+        off();
+      } catch (_err) {
+      }
+    }
+  };
+  for (const sig of list) {
+    if (sig.aborted) {
+      abortWith(sig.reason);
+      return controller.signal;
+    }
+    const onAbort = () => abortWith(sig.reason);
+    sig.addEventListener("abort", onAbort, { once: true });
+    cleanups.push(() => sig.removeEventListener("abort", onAbort));
+  }
+  return controller.signal;
+}
 function createOpenAIClient({ apiKey, baseURL, hooks, timeoutMs }) {
   const requestFetch = async (url, init = {}) => {
+    ensureTaskActive(hooks);
     const method = String(init?.method || "GET").toUpperCase();
     const headers = headersToObject(init?.headers);
     const body = parseBodyForDebug(init?.body);
@@ -15867,7 +15950,8 @@ function createOpenAIClient({ apiKey, baseURL, hooks, timeoutMs }) {
       body,
       timeoutMs: Number(timeoutMs || 0)
     });
-    const resp = await fetchWithTimeout(url, init, timeoutMs);
+    const mergedSignal = mergeAbortSignals(init?.signal, hooks?.cancelSignal);
+    const resp = await fetchWithTimeout(url, { ...init, signal: mergedSignal }, timeoutMs);
     emitDebug(hooks, "OpenAI SDK Response", { method, url: String(url || ""), headers }, `status: ${resp.status}`);
     return resp;
   };
@@ -15915,6 +15999,13 @@ async function handleMessage(message) {
       }
       await chrome.storage.local.remove(TASK_STATE_KEY);
       return { ok: true };
+    }
+    case "STOP_AGENT_TASK": {
+      const wantedID = String(payload?.taskId || "");
+      if (wantedID && runningTask && runningTask.id !== wantedID) {
+        return { ok: false, error: "\u76EE\u6807\u4EFB\u52A1\u5DF2\u53D8\u5316\u6216\u4E0D\u5B58\u5728" };
+      }
+      return stopRunningTask(String(payload?.reason || "\u7528\u6237\u624B\u52A8\u505C\u6B62\u4EFB\u52A1"));
     }
     case "SAVE_SETTINGS":
       await saveSettings(payload);
@@ -16097,6 +16188,7 @@ tried: ${tried.join(" | ")}`
   };
 }
 async function runAgent(prompt, overrideSettings = {}, hooks = {}) {
+  ensureTaskActive(hooks);
   const cleanPrompt = String(prompt || "").trim();
   if (!cleanPrompt) {
     return { ok: false, error: "prompt is empty" };
@@ -16120,6 +16212,9 @@ async function runAgent(prompt, overrideSettings = {}, hooks = {}) {
   const agentHooks = {
     ...hooks,
     onDelta: (delta) => {
+      if (hooks?.cancelSignal?.aborted) {
+        return;
+      }
       const text = String(delta || "");
       if (text) {
         streamedAssistant += text;
@@ -16128,6 +16223,7 @@ async function runAgent(prompt, overrideSettings = {}, hooks = {}) {
     }
   };
   let result;
+  ensureTaskActive(agentHooks);
   if (isWholePageTranslateRequest(cleanPrompt)) {
     if (isRestrictedBrowserPage(tabURL)) {
       return { ok: false, error: "\u6D4F\u89C8\u5668\u5185\u90E8\u9875\u9762\u65E0\u6CD5\u8BFB/\u6539 DOM\uFF0C\u6574\u9875\u7FFB\u8BD1\u8BF7\u5728 http/https \u666E\u901A\u7F51\u9875\u6267\u884C" };
@@ -16136,6 +16232,7 @@ async function runAgent(prompt, overrideSettings = {}, hooks = {}) {
   } else {
     result = await runFunctionCallingAgent(cleanPrompt, tab.id, tabURL, settings, agentHooks);
   }
+  ensureTaskActive(agentHooks);
   const finalText = normalizeMemoryText(result?.message || "");
   const partialText = normalizeMemoryText(streamedAssistant);
   const fallbackText = result?.ok ? "\u6267\u884C\u5B8C\u6210" : `\u672A\u5B8C\u6210: ${String(result?.error || "\u672A\u77E5\u9519\u8BEF")}`;
@@ -16146,12 +16243,14 @@ async function runAgent(prompt, overrideSettings = {}, hooks = {}) {
   return result;
 }
 async function runWholePageTranslate(prompt, tabId, settings, hooks) {
+  ensureTaskActive(hooks);
   hooks.onStatus?.("\u8BFB\u53D6\u6574\u9875 HTML...");
   const originalHTML = await getWholePageHTML(tabId);
   if (!originalHTML || originalHTML.length < 200) {
     return { ok: false, error: "\u9875\u9762\u5185\u5BB9\u8FC7\u5C11\uFF0C\u65E0\u6CD5\u6267\u884C\u6574\u9875\u7FFB\u8BD1" };
   }
   hooks.onStatus?.("\u6A21\u578B\u7FFB\u8BD1\u4E2D...");
+  ensureTaskActive(hooks);
   const translatedHTML = await translateWholePageHTML({
     apiKey: settings.apiKey,
     model: settings.model,
@@ -16166,6 +16265,7 @@ async function runWholePageTranslate(prompt, tabId, settings, hooks) {
     hooks
   });
   hooks.onStatus?.("\u66FF\u6362\u9875\u9762\u5185\u5BB9...");
+  ensureTaskActive(hooks);
   const replaceRes = await replaceWholePageHTML(tabId, translatedHTML);
   return {
     ok: true,
@@ -16173,6 +16273,7 @@ async function runWholePageTranslate(prompt, tabId, settings, hooks) {
   };
 }
 async function runFunctionCallingAgent(prompt, tabId, tabURL, settings, hooks) {
+  ensureTaskActive(hooks);
   const attachPageContext = shouldAttachPageContext(prompt);
   if (attachPageContext && isRestrictedBrowserPage(tabURL)) {
     return {
@@ -16183,10 +16284,12 @@ async function runFunctionCallingAgent(prompt, tabId, tabURL, settings, hooks) {
   let snapshot = { title: "", url: "", selectedText: "", nodes: [] };
   if (attachPageContext) {
     hooks.onStatus?.("\u52A0\u8F7D\u9875\u9762\u5FEB\u7167...");
+    ensureTaskActive(hooks);
     snapshot = await collectPageSnapshot(tabId);
   } else {
     hooks.onStatus?.("\u8DF3\u8FC7\u9875\u9762\u5FEB\u7167(\u672C\u8F6E\u6309\u9700\u8C03\u7528\u9875\u9762\u5DE5\u5177)...");
   }
+  ensureTaskActive(hooks);
   const memoryEntries = await getConversationMemory(tabId);
   return runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, snapshot, memoryEntries, attachPageContext);
 }
@@ -16195,6 +16298,7 @@ function isRestrictedBrowserPage(url) {
   return raw.startsWith("chrome://") || raw.startsWith("edge://") || raw.startsWith("chrome-extension://");
 }
 async function runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, snapshot, memoryEntries, attachPageContext = true) {
+  ensureTaskActive(hooks);
   hooks.onStatus?.("\u52A0\u8F7D\u5DE5\u5177\u5217\u8868...");
   const mcpRegistry = await fetchMCPTools(settings);
   const tools = buildToolSpecs(settings.allowScript, mcpRegistry.toolSpecs || []);
@@ -16237,6 +16341,7 @@ async function runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, sna
   ];
   const maxTurns = normalizeToolTurnLimit(settings.toolTurnLimit);
   for (let turn = 1; ; turn += 1) {
+    ensureTaskActive(hooks);
     if (maxTurns > 0 && turn > maxTurns) {
       return { ok: false, error: `\u5DE5\u5177\u8C03\u7528\u8F6E\u6B21\u8FBE\u5230\u4E0A\u9650(${maxTurns})\uFF0C\u5EFA\u8BAE\u7F29\u5C0F\u4EFB\u52A1\u8303\u56F4` };
     }
@@ -16271,11 +16376,13 @@ async function runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, sna
       tool_calls: toolCalls
     });
     for (const call of toolCalls) {
+      ensureTaskActive(hooks);
       const toolResult = await executeToolCall(call, {
         tabId,
         settings,
         mcpRegistry,
-        hooks
+        hooks,
+        depth: 0
       });
       messages.push({
         role: "tool",
@@ -17142,6 +17249,7 @@ function defineTool(name, description, parameters) {
   };
 }
 async function executeToolCall(call, ctx) {
+  ensureTaskActive(ctx?.hooks);
   const name = call?.function?.name || "";
   const args = parseToolArgs(call?.function?.arguments || "{}");
   const depth = Number(ctx?.depth || 0);
@@ -18772,6 +18880,7 @@ function joinURL(base, path2) {
   return `${b}/${p}`;
 }
 async function callChatCompletion({ apiKey, baseURL, model, thinkingLevel, timeoutMs, messages, tools, stream, hooks }) {
+  ensureTaskActive(hooks);
   const body = {
     model,
     messages,
@@ -18788,6 +18897,7 @@ async function callChatCompletion({ apiKey, baseURL, model, thinkingLevel, timeo
   const tried = [];
   let lastError = "";
   for (const candidate of baseCandidates) {
+    ensureTaskActive(hooks);
     tried.push(candidate);
     try {
       const client = createOpenAIClient({
@@ -18805,6 +18915,7 @@ async function callChatCompletion({ apiKey, baseURL, model, thinkingLevel, timeo
       let fallbackReasoningFull = "";
       const toolCallMap = /* @__PURE__ */ new Map();
       for await (const chunk of streamResp) {
+        ensureTaskActive(hooks);
         const deltaParts = extractDeltaPartsFromChatChunk(chunk);
         if (!deltaParts.answer || !deltaParts.reasoning) {
           const fallbackParts = extractFallbackDeltaPartsFromChatChunk(chunk);
@@ -18878,6 +18989,9 @@ async function callChatCompletion({ apiKey, baseURL, model, thinkingLevel, timeo
         ]
       };
     } catch (err) {
+      if (hooks?.cancelSignal?.aborted || isTaskCancelledError(err)) {
+        throw createTaskCancelledError(hooks?.cancelReason || hooks?.cancelSignal?.reason || "\u4EFB\u52A1\u5DF2\u505C\u6B62");
+      }
       lastError = formatOpenAIError(err);
       if (getErrorStatus(err) !== 404) {
         throw new Error(`${lastError} (${candidate})`);
@@ -19013,6 +19127,7 @@ function safeJSONString(value) {
   }
 }
 async function requestModelText({ apiKey, model, thinkingLevel, baseURL, timeoutMs, systemPrompt, userPayload, stream, onDelta, onReasoning, hooks }) {
+  ensureTaskActive(hooks);
   const body = {
     model,
     messages: [
@@ -19030,6 +19145,7 @@ async function requestModelText({ apiKey, model, thinkingLevel, baseURL, timeout
   const tried = [];
   let lastError = "";
   for (const candidate of baseCandidates) {
+    ensureTaskActive(hooks);
     tried.push(candidate);
     try {
       const client = createOpenAIClient({
@@ -19052,6 +19168,7 @@ async function requestModelText({ apiKey, model, thinkingLevel, baseURL, timeout
       let fallbackAnswerFull = "";
       let fallbackReasoningFull = "";
       for await (const chunk of streamResp) {
+        ensureTaskActive(hooks);
         const deltaParts = extractDeltaPartsFromChatChunk(chunk);
         if (!deltaParts.answer || !deltaParts.reasoning) {
           const fallbackParts = extractFallbackDeltaPartsFromChatChunk(chunk);
@@ -19103,6 +19220,9 @@ async function requestModelText({ apiKey, model, thinkingLevel, baseURL, timeout
       }
       return extractResponseText(fallbackData);
     } catch (err) {
+      if (hooks?.cancelSignal?.aborted || isTaskCancelledError(err)) {
+        throw createTaskCancelledError(hooks?.cancelReason || hooks?.cancelSignal?.reason || "\u4EFB\u52A1\u5DF2\u505C\u6B62");
+      }
       lastError = formatOpenAIError(err);
       if (getErrorStatus(err) !== 404) {
         throw new Error(`${lastError} (${candidate})`);

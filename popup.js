@@ -5,6 +5,7 @@ const baseUrlInput = document.getElementById("baseUrlInput");
 const allowScriptInput = document.getElementById("allowScriptInput");
 const requestTimeoutSecInput = document.getElementById("requestTimeoutSecInput");
 const toolTurnLimitInput = document.getElementById("toolTurnLimitInput");
+const unlimitedTurnsInput = document.getElementById("unlimitedTurnsInput");
 const thinkingLevelInput = document.getElementById("thinkingLevelInput");
 const saveStatus = document.getElementById("saveStatus");
 const addMcpServiceBtn = document.getElementById("addMcpServiceBtn");
@@ -31,6 +32,7 @@ const DEFAULT_THINKING_LEVEL = "auto";
 
 const state = {
   running: false,
+  stopping: false,
   saveTimer: null,
   uiSaveTimer: null,
   modelFetchInFlight: false,
@@ -45,6 +47,7 @@ const state = {
   reasoningCollapsed: false,
   mcpServices: [],
   currentTaskId: "",
+  streamPort: null,
 };
 
 async function callBackground(type, payload = {}) {
@@ -187,10 +190,24 @@ function normalizeToolTurnLimit(value) {
   }
   return Math.max(0, Math.floor(raw));
 }
+function syncToolTurnLimitUI(value) {
+  const normalized = normalizeToolTurnLimit(value);
+  const unlimited = normalized === 0;
+  if (unlimitedTurnsInput) {
+    unlimitedTurnsInput.checked = unlimited;
+  }
+  if (toolTurnLimitInput) {
+    toolTurnLimitInput.disabled = unlimited;
+    toolTurnLimitInput.value = String(normalized);
+  }
+}
 
 function setRunning(on, text = "") {
   state.running = on;
-  runBtn.disabled = on;
+  if (!on) {
+    state.stopping = false;
+  }
+  runBtn.disabled = false;
   promptInput.disabled = on;
   thinkingLevelInput.disabled = on;
   document.querySelectorAll(".quick-btn").forEach((btn) => {
@@ -201,7 +218,20 @@ function setRunning(on, text = "") {
   } else {
     runState.textContent = "";
   }
+  renderRunButton();
   updateModelAvailability();
+}
+function renderRunButton() {
+  runBtn.classList.toggle("stop", state.running);
+  if (state.running) {
+    runBtn.textContent = state.stopping ? "…" : "■";
+    runBtn.title = state.stopping ? "停止中" : "停止";
+    runBtn.disabled = !!state.stopping;
+  } else {
+    runBtn.textContent = "➤";
+    runBtn.title = "发送";
+    runBtn.disabled = false;
+  }
 }
 
 function resetStreamingNode() {
@@ -328,7 +358,7 @@ async function syncSettingsFromBackground(options = {}) {
   baseUrlInput.value = res.settings.baseURL || "https://api.openai.com/v1";
   allowScriptInput.checked = !!res.settings.allowScript;
   requestTimeoutSecInput.value = String(normalizeRequestTimeoutSec(res.settings.requestTimeoutSec));
-  toolTurnLimitInput.value = String(normalizeToolTurnLimit(res.settings.toolTurnLimit));
+  syncToolTurnLimitUI(res.settings.toolTurnLimit);
   state.mcpServices = normalizeMcpServices(res.settings.mcpServices || []);
   renderMcpServices();
 
@@ -664,7 +694,7 @@ function collectSettingsFromUI() {
   const thinkingLevel = normalizeThinkingLevel(thinkingLevelInput?.value);
   thinkingLevelInput.value = thinkingLevel;
   const requestTimeoutSec = normalizeRequestTimeoutSec(requestTimeoutSecInput?.value);
-  const toolTurnLimit = normalizeToolTurnLimit(toolTurnLimitInput?.value);
+  const toolTurnLimit = unlimitedTurnsInput?.checked ? 0 : normalizeToolTurnLimit(toolTurnLimitInput?.value);
   return {
     apiKey: apiKeyInput.value.trim(),
     model: getCurrentModelValue(),
@@ -830,7 +860,16 @@ function applyTaskSnapshot(task = {}) {
 }
 
 function startAgentStream(payload) {
+  if (state.streamPort) {
+    try {
+      state.streamPort.disconnect();
+    } catch (_err) {
+      // ignore
+    }
+    state.streamPort = null;
+  }
   const port = chrome.runtime.connect({ name: "agent_stream" });
+  state.streamPort = port;
   let done = false;
 
   port.onMessage.addListener((msg) => {
@@ -883,11 +922,19 @@ function startAgentStream(payload) {
       return;
     }
 
+    if (msg.type === "stopped") {
+      finalizeStreamingNode();
+      appendBubble(msg.message || "任务已停止", "assistant");
+      return;
+    }
+
     if (msg.type === "done") {
       done = true;
       state.currentTaskId = "";
+      state.stopping = false;
       setRunning(false, "");
       void syncSettingsFromBackground({ silent: true });
+      state.streamPort = null;
       try {
         port.disconnect();
       } catch (_err) {
@@ -897,12 +944,37 @@ function startAgentStream(payload) {
   });
 
   port.onDisconnect.addListener(() => {
+    if (state.streamPort === port) {
+      state.streamPort = null;
+    }
+    if (state.stopping) {
+      state.stopping = false;
+      renderRunButton();
+    }
     if (!done) {
       appendBubble("实时连接已断开，后台任务仍可能继续。重新打开弹窗会自动恢复。", "assistant");
     }
   });
 
   port.postMessage(payload);
+}
+async function stopCurrentTask() {
+  if (!state.running || state.stopping) {
+    return;
+  }
+  state.stopping = true;
+  renderRunButton();
+  runState.textContent = "停止中...";
+  const res = await callBackground("STOP_AGENT_TASK", {
+    taskId: state.currentTaskId || "",
+    reason: "用户手动停止任务",
+  });
+  if (!res?.ok) {
+    state.stopping = false;
+    renderRunButton();
+    appendBubble(res?.error || "停止失败", "error");
+    return;
+  }
 }
 
 async function tryResumeBackgroundTask() {
@@ -997,7 +1069,7 @@ async function runCommand() {
 }
 
 function bindEvents() {
-  [apiKeyInput, modelInput, quickModelInput, baseUrlInput, allowScriptInput, requestTimeoutSecInput, toolTurnLimitInput, thinkingLevelInput].forEach((el) => {
+  [apiKeyInput, modelInput, quickModelInput, baseUrlInput, allowScriptInput, requestTimeoutSecInput, toolTurnLimitInput, unlimitedTurnsInput, thinkingLevelInput].forEach((el) => {
     el.addEventListener("input", scheduleSave);
     el.addEventListener("change", scheduleSave);
   });
@@ -1010,9 +1082,24 @@ function bindEvents() {
     scheduleSave();
   });
   toolTurnLimitInput.addEventListener("blur", () => {
-    toolTurnLimitInput.value = String(normalizeToolTurnLimit(toolTurnLimitInput.value));
+    if (unlimitedTurnsInput?.checked) {
+      syncToolTurnLimitUI(0);
+    } else {
+      syncToolTurnLimitUI(toolTurnLimitInput.value);
+    }
     scheduleSave();
   });
+  if (unlimitedTurnsInput) {
+    unlimitedTurnsInput.addEventListener("change", () => {
+      if (unlimitedTurnsInput.checked) {
+        syncToolTurnLimitUI(0);
+      } else {
+        const current = normalizeToolTurnLimit(toolTurnLimitInput?.value);
+        syncToolTurnLimitUI(current === 0 ? 20 : current);
+      }
+      scheduleSave();
+    });
+  }
 
   apiKeyInput.addEventListener("input", () => {
     if (!apiKeyInput.value.trim()) {
@@ -1071,7 +1158,13 @@ function bindEvents() {
     }
   });
 
-  runBtn.addEventListener("click", runCommand);
+  runBtn.addEventListener("click", async () => {
+    if (state.running) {
+      await stopCurrentTask();
+      return;
+    }
+    await runCommand();
+  });
   clearBtn.addEventListener("click", async () => {
     chatLogNode.innerHTML = "";
     resetStreamingNode();

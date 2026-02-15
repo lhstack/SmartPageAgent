@@ -112,10 +112,20 @@
             <input id="requestTimeoutSecInput" type="number" min="5" max="600" step="1" value="120" />
           </label>
 
-          <label>
-            工具调用轮次上限（0=不限制）
-            <input id="toolTurnLimitInput" type="number" min="0" step="1" value="0" />
-          </label>
+          <section class="automation-panel">
+            <div class="mcp-panel-head">
+              <strong>自动化执行</strong>
+            </div>
+            <label class="checkbox-row">
+              <input id="unlimitedTurnsInput" type="checkbox" checked />
+              <span>不限轮次（等同 0，可一直循环直到手动停止）</span>
+            </label>
+            <label>
+              工具调用轮次上限
+              <input id="toolTurnLimitInput" type="number" min="0" step="1" value="0" />
+            </label>
+            <div class="tip">开启“不限轮次”时，轮次上限输入框会禁用并固定为 0。</div>
+          </section>
 
           <div class="tip">接口路径由 OpenAI SDK 自动处理，仅需配置 Base URL。</div>
           <div id="saveStatus" class="tip">设置会自动保存到本地</div>

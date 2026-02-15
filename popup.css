@@ -335,6 +335,16 @@ select:focus {
   cursor: pointer;
 }
 
+.send-btn.stop {
+  border-color: #d06969;
+  background: linear-gradient(180deg, #ea7a7a, #d66565);
+}
+
+.send-btn:disabled {
+  opacity: 0.75;
+  cursor: not-allowed;
+}
+
 .modal {
   position: fixed;
   inset: 0;
@@ -404,6 +414,15 @@ label {
 }
 
 .model-panel {
+  border: 1px solid #d8e3f2;
+  border-radius: 10px;
+  background: #f8fbff;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.automation-panel {
   border: 1px solid #d8e3f2;
   border-radius: 10px;
   background: #f8fbff;

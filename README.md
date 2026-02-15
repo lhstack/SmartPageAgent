@@ -9,6 +9,7 @@
 - 模型列表拉取与缓存（30 秒）
 - 对话流式输出（含推理内容分区展示）
 - Function Calling 循环执行（多轮工具调用）
+- 自动化执行控制（不限轮次/轮次上限、运行中可手动停止）
 - 页面操作工具（抓取 DOM、改属性、改文本、整页替换等）
 - 本地存储工具（`set_storage` / `get_storage`）
 - 加解密与编码工具（AES/DES/3DES、RSA、base64/hex/unicode）
@@ -20,6 +21,9 @@
 
 - 已移除抓包相关功能（`start_network_capture` / `get_network_capture` / `stop_network_capture`）。
 - SSE MCP 链路已支持按 JSON-RPC `id` 对齐响应，兼容 `POST` 空响应体场景。
+- 新增自动化测试工具：`tool_list` / `open_url` / `wait_for_element` / `assert_page_state` / `batch_execute`。
+- 新增任务停止能力：运行中发送按钮会切换为停止按钮，可手动中断模型与工具循环。
+- 设置弹窗新增“自动化执行”区块，支持“不限轮次（0）”与轮次上限切换。
 
 ## 内置网页工具
 
@@ -130,6 +134,15 @@
 
 `batch_execute` 示例：  
 - `{"stopOnError":true,"steps":[{"name":"open_url","args":{"url":"https://example.com/login"}},{"name":"wait_for_element","args":{"selector":"input[name='email']","timeoutSec":20}},{"name":"input_text","args":{"selector":"input[name='email']","text":"demo@example.com"}},{"name":"input_text","args":{"selector":"input[name='password']","text":"123456"}},{"name":"click_element","args":{"selector":"button[type='submit']"}},{"name":"assert_page_state","args":{"checks":[{"type":"url","contains":"dashboard"}]}}]}`
+
+## 自动化测试建议
+
+1. 先用 `tool_list` 确认当前可用工具。  
+2. 用 `open_url` + `wait_for_element` 进入并等待页面稳定。  
+3. 用 `input_text` / `select_option` / `click_element` 执行交互。  
+4. 每轮用 `assert_page_state` 做通过判定（URL/标题/文本/元素计数）。  
+5. 复杂流程优先用 `batch_execute` 组合为一个批次，并通过 `stopOnError` 控制失败策略。  
+6. 若设置为不限轮次（0），模型在“无后续 tool call”时会自动结束；也可随时点击停止按钮中断任务。
 
 `click_element` 示例：  
 - `{"selector":"button.submit"}`
