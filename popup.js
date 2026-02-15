@@ -312,8 +312,37 @@ function finalizeStreamingNode() {
   scheduleUICacheSave();
 }
 
+async function syncSettingsFromBackground(options = {}) {
+  const silent = !!options.silent;
+  const res = await callBackground("GET_SETTINGS");
+  if (!res?.ok) {
+    if (!silent) {
+      setSaveStatus(res?.error || "读取设置失败", true);
+    }
+    return false;
+  }
+
+  apiKeyInput.value = res.settings.apiKey || "";
+  setModelValue(res.settings.model || "");
+  thinkingLevelInput.value = normalizeThinkingLevel(res.settings.thinkingLevel);
+  baseUrlInput.value = res.settings.baseURL || "https://api.openai.com/v1";
+  allowScriptInput.checked = !!res.settings.allowScript;
+  requestTimeoutSecInput.value = String(normalizeRequestTimeoutSec(res.settings.requestTimeoutSec));
+  toolTurnLimitInput.value = String(normalizeToolTurnLimit(res.settings.toolTurnLimit));
+  state.mcpServices = normalizeMcpServices(res.settings.mcpServices || []);
+  renderMcpServices();
+
+  updateModelAvailability();
+  updateSelectedModelHint();
+  if (!silent) {
+    setSaveStatus("设置已同步");
+  }
+  return true;
+}
+
 function openSettings() {
   settingsModal.classList.remove("hidden");
+  void syncSettingsFromBackground({ silent: true });
 }
 
 function closeSettings() {
@@ -649,24 +678,7 @@ function collectSettingsFromUI() {
 }
 
 async function loadSettings() {
-  const res = await callBackground("GET_SETTINGS");
-  if (!res?.ok) {
-    setSaveStatus(res?.error || "读取设置失败", true);
-    return;
-  }
-
-  apiKeyInput.value = res.settings.apiKey || "";
-  setModelValue(res.settings.model || "");
-  thinkingLevelInput.value = normalizeThinkingLevel(res.settings.thinkingLevel);
-  baseUrlInput.value = res.settings.baseURL || "https://api.openai.com/v1";
-  allowScriptInput.checked = !!res.settings.allowScript;
-  requestTimeoutSecInput.value = String(normalizeRequestTimeoutSec(res.settings.requestTimeoutSec));
-  toolTurnLimitInput.value = String(normalizeToolTurnLimit(res.settings.toolTurnLimit));
-  state.mcpServices = normalizeMcpServices(res.settings.mcpServices || []);
-  renderMcpServices();
-
-  updateModelAvailability();
-  updateSelectedModelHint();
+  await syncSettingsFromBackground({ silent: false });
 }
 
 function scheduleSave() {
@@ -875,6 +887,7 @@ function startAgentStream(payload) {
       done = true;
       state.currentTaskId = "";
       setRunning(false, "");
+      void syncSettingsFromBackground({ silent: true });
       try {
         port.disconnect();
       } catch (_err) {

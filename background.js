@@ -1,9 +1,11 @@
 import OpenAI from "openai";
+import CryptoJS from "crypto-js";
 
 var SETTINGS_KEY = "web_agent_settings_v1";
 var TASK_STATE_KEY = "web_agent_last_task_v1";
 var AGENT_MEMORY_KEY = "web_agent_memory_v1";
 var AGENT_TOOL_STORAGE_KEY = "web_agent_tool_storage_v1";
+var AGENT_CRYPTO_PROFILE_STORAGE_KEY = "web_agent_crypto_profiles_v1";
 var ENABLE_TRACE_LOGS = false;
 var DEFAULT_SETTINGS = {
   apiKey: "",
@@ -334,6 +336,1550 @@ async function getToolStorage(args) {
     return { ok: true, key, exists: false, value: null };
   }
   return { ok: true, key, exists: true, value: store[key] };
+}
+function normalizeCryptoEncoding(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "utf8" || raw === "utf-8") return "utf8";
+  if (raw === "base64" || raw === "hex" || raw === "unicode") return raw;
+  return "utf8";
+}
+function normalizeSymmetricAlgorithm(value) {
+  const raw = String(value || "").trim().toUpperCase();
+  if (raw === "3DES" || raw === "DES3" || raw === "TRIPLEDES") return "DESEDE";
+  if (raw === "AES" || raw === "DES" || raw === "DESEDE") return raw;
+  return "AES";
+}
+function normalizeSymmetricMode(value) {
+  const raw = String(value || "").trim().toUpperCase();
+  if (raw === "ECB" || raw === "CBC") return raw;
+  return "ECB";
+}
+function normalizeSymmetricKeySize(value) {
+  const raw = Number(value);
+  if (raw === 64 || raw === 128 || raw === 192 || raw === 256) return raw;
+  return 128;
+}
+function normalizeCryptoProfileId(value) {
+  const id = String(value || "").trim();
+  if (!id) return "";
+  if (id.length > 128) return "";
+  if (!/^[a-zA-Z0-9._:-]+$/.test(id)) return "";
+  return id;
+}
+function createCryptoProfileId() {
+  return `crypto_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+function normalizeCryptoProfile(input = {}) {
+  const now = Date.now();
+  const createdAt = Number(input.createdAt || now);
+  const updatedAt = Number(input.updatedAt || now);
+  return {
+    id: normalizeCryptoProfileId(input.id) || createCryptoProfileId(),
+    name: String(input.name || "").trim().slice(0, 80),
+    algorithm: normalizeSymmetricAlgorithm(input.algorithm),
+    mode: normalizeSymmetricMode(input.mode),
+    keySize: normalizeSymmetricKeySize(input.keySize),
+    keyEncoding: normalizeCryptoEncoding(input.keyEncoding),
+    keyValue: String(input.keyValue || ""),
+    ivEncoding: normalizeCryptoEncoding(input.ivEncoding),
+    ivValue: String(input.ivValue || ""),
+    description: String(input.description || "").trim().slice(0, 500),
+    createdAt: Number.isFinite(createdAt) ? createdAt : now,
+    updatedAt: Number.isFinite(updatedAt) ? updatedAt : now
+  };
+}
+function normalizeCryptoProfiles(items) {
+  if (!Array.isArray(items)) return [];
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const item of items) {
+    const one = normalizeCryptoProfile(item);
+    if (!one.id || seen.has(one.id)) continue;
+    seen.add(one.id);
+    out.push(one);
+  }
+  return out;
+}
+async function loadCryptoProfiles() {
+  const data = await chrome.storage.local.get(AGENT_CRYPTO_PROFILE_STORAGE_KEY);
+  const raw = data?.[AGENT_CRYPTO_PROFILE_STORAGE_KEY];
+  if (!raw || typeof raw !== "object") return [];
+  if (Array.isArray(raw)) return normalizeCryptoProfiles(raw);
+  if (Array.isArray(raw.profiles)) return normalizeCryptoProfiles(raw.profiles);
+  return [];
+}
+async function saveCryptoProfiles(list) {
+  const profiles = normalizeCryptoProfiles(list);
+  await chrome.storage.local.set({
+    [AGENT_CRYPTO_PROFILE_STORAGE_KEY]: {
+      updatedAt: Date.now(),
+      profiles
+    }
+  });
+  return profiles;
+}
+function bytesToWordArray(bytes) {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  const words = [];
+  for (let i = 0; i < view.length; i += 1) {
+    words[i >>> 2] |= view[i] << 24 - (i % 4) * 8;
+  }
+  return CryptoJS.lib.WordArray.create(words, view.length);
+}
+function wordArrayToBytes(wordArray) {
+  const sigBytes = Number(wordArray?.sigBytes || 0);
+  const words = wordArray?.words || [];
+  const out = new Uint8Array(sigBytes);
+  for (let i = 0; i < sigBytes; i += 1) {
+    out[i] = words[i >>> 2] >>> 24 - (i % 4) * 8 & 255;
+  }
+  return out;
+}
+function decodeBase64(value) {
+  try {
+    const text = String(value || "").replace(/\s+/g, "");
+    const raw = globalThis.atob(text);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) {
+      out[i] = raw.charCodeAt(i);
+    }
+    return out;
+  } catch (_err) {
+    return null;
+  }
+}
+function encodeBase64(bytes) {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  let raw = "";
+  for (const b of view) {
+    raw += String.fromCharCode(b);
+  }
+  return globalThis.btoa(raw);
+}
+function decodeHex(value) {
+  const text = String(value || "").trim().replace(/\s+/g, "");
+  if (!text) return new Uint8Array([]);
+  if (text.length % 2 !== 0) return null;
+  if (!/^[0-9a-fA-F]+$/.test(text)) return null;
+  const out = new Uint8Array(text.length / 2);
+  for (let i = 0; i < text.length; i += 2) {
+    out[i / 2] = parseInt(text.slice(i, i + 2), 16);
+  }
+  return out;
+}
+function encodeHex(bytes) {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  let out = "";
+  for (const b of view) {
+    out += b.toString(16).padStart(2, "0");
+  }
+  return out;
+}
+function unicodeEncode(text) {
+  let out = "";
+  const raw = String(text || "");
+  for (let i = 0; i < raw.length; i += 1) {
+    const code = raw.charCodeAt(i);
+    out += `\\u${code.toString(16).padStart(4, "0")}`;
+  }
+  return out;
+}
+function unicodeDecode(text) {
+  try {
+    return String(text || "").replace(/\\u([0-9a-fA-F]{4})/g, (_m, g1) => String.fromCharCode(parseInt(g1, 16)));
+  } catch (_err) {
+    return "";
+  }
+}
+function parseBytes(value, encoding, fieldName = "value") {
+  const mode = normalizeCryptoEncoding(encoding);
+  const text = String(value || "");
+  if (mode === "utf8") {
+    return { ok: true, bytes: new TextEncoder().encode(text) };
+  }
+  if (mode === "unicode") {
+    return { ok: true, bytes: new TextEncoder().encode(unicodeDecode(text)) };
+  }
+  if (mode === "base64") {
+    const parsed = decodeBase64(text);
+    if (!parsed) return { ok: false, error: `${fieldName} is not valid base64` };
+    return { ok: true, bytes: parsed };
+  }
+  const parsed = decodeHex(text);
+  if (!parsed) return { ok: false, error: `${fieldName} is not valid hex` };
+  return { ok: true, bytes: parsed };
+}
+function formatBytes(bytes, encoding) {
+  const mode = normalizeCryptoEncoding(encoding);
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  if (mode === "base64") return encodeBase64(view);
+  if (mode === "hex") return encodeHex(view);
+  const text = new TextDecoder().decode(view);
+  if (mode === "unicode") return unicodeEncode(text);
+  return text;
+}
+function normalizeToSize(bytes, bitSize) {
+  const sizeBytes = Math.max(1, Math.floor(Number(bitSize || 0) / 8));
+  const out = new Uint8Array(sizeBytes);
+  const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  out.set(src.slice(0, sizeBytes), 0);
+  return out;
+}
+function resolveKeySpec(algorithm, keySize) {
+  const algo = normalizeSymmetricAlgorithm(algorithm);
+  const raw = normalizeSymmetricKeySize(keySize);
+  if (algo === "DES") {
+    return { keySize: 64, note: raw === 64 ? "" : "DES keySize fixed to 64 bits" };
+  }
+  if (algo === "DESEDE") {
+    if (raw === 128 || raw === 192) return { keySize: raw, note: "" };
+    if (raw === 64) return { keySize: 128, note: "DESede keySize 64 adjusted to 128 bits" };
+    if (raw === 256) return { keySize: 192, note: "DESede keySize 256 adjusted to 192 bits" };
+    return { keySize: 192, note: "" };
+  }
+  if (raw === 128 || raw === 192 || raw === 256) return { keySize: raw, note: "" };
+  if (raw === 64) return { keySize: 128, note: "AES keySize 64 adjusted to 128 bits" };
+  return { keySize: 128, note: "" };
+}
+function resolveProfileRef(profiles, args = {}) {
+  const id = normalizeCryptoProfileId(args.profileId || args.id);
+  const name = String(args.profileName || args.name || "").trim().toLowerCase();
+  const index = Number(args.index);
+  if (id) {
+    return profiles.find((item) => item.id === id) || null;
+  }
+  if (name) {
+    return profiles.find((item) => String(item.name || "").trim().toLowerCase() === name) || null;
+  }
+  if (Number.isInteger(index) && index >= 0 && index < profiles.length) {
+    return profiles[index];
+  }
+  return null;
+}
+function resolveProfileRefs(profiles, args = {}) {
+  if (!Array.isArray(profiles) || profiles.length === 0) return [];
+  if (args.all === true) return profiles.slice();
+  const idSet = /* @__PURE__ */ new Set();
+  const addById = (value) => {
+    const id = normalizeCryptoProfileId(value);
+    if (!id) return;
+    const found = profiles.find((item) => item.id === id);
+    if (found) idSet.add(found.id);
+  };
+  const addByName = (value) => {
+    const name = String(value || "").trim().toLowerCase();
+    if (!name) return;
+    for (const item of profiles) {
+      if (String(item.name || "").trim().toLowerCase() === name) {
+        idSet.add(item.id);
+      }
+    }
+  };
+  const addByIndex = (value) => {
+    const index = Number(value);
+    if (!Number.isInteger(index)) return;
+    if (index < 0 || index >= profiles.length) return;
+    idSet.add(profiles[index].id);
+  };
+  addById(args.profileId || args.id);
+  addByName(args.profileName || args.name);
+  addByIndex(args.index);
+  if (Array.isArray(args.profileIds)) {
+    args.profileIds.forEach(addById);
+  }
+  if (Array.isArray(args.profileNames)) {
+    args.profileNames.forEach(addByName);
+  }
+  if (Array.isArray(args.indexes)) {
+    args.indexes.forEach(addByIndex);
+  }
+  const query = String(args.query || "").trim().toLowerCase();
+  if (query) {
+    for (const item of profiles) {
+      if (String(item.name || "").trim().toLowerCase().includes(query)) {
+        idSet.add(item.id);
+      }
+    }
+  }
+  if (idSet.size === 0) {
+    const single = resolveProfileRef(profiles, args);
+    if (single) idSet.add(single.id);
+  }
+  return profiles.filter((item) => idSet.has(item.id));
+}
+function buildSymmetricConfig(args = {}, profile = null) {
+  const source = profile || {};
+  const algorithm = normalizeSymmetricAlgorithm(args.algorithm || source.algorithm);
+  const mode = normalizeSymmetricMode(args.mode || source.mode);
+  const keyEncoding = normalizeCryptoEncoding(args.keyEncoding || source.keyEncoding);
+  const ivEncoding = normalizeCryptoEncoding(args.ivEncoding || source.ivEncoding);
+  const keyValue = Object.prototype.hasOwnProperty.call(args, "key") ? String(args.key || "") : Object.prototype.hasOwnProperty.call(args, "keyValue") ? String(args.keyValue || "") : String(source.keyValue || "");
+  const ivValue = Object.prototype.hasOwnProperty.call(args, "iv") ? String(args.iv || "") : Object.prototype.hasOwnProperty.call(args, "ivValue") ? String(args.ivValue || "") : String(source.ivValue || "");
+  const keySpec = resolveKeySpec(algorithm, args.keySize || source.keySize);
+  return {
+    algorithm,
+    mode,
+    keySize: keySpec.keySize,
+    keySizeNote: keySpec.note,
+    keyEncoding,
+    keyValue,
+    ivEncoding,
+    ivValue
+  };
+}
+function getCryptoEngine(algorithm) {
+  const algo = normalizeSymmetricAlgorithm(algorithm);
+  if (algo === "DES") return CryptoJS.DES;
+  if (algo === "DESEDE") return CryptoJS.TripleDES;
+  return CryptoJS.AES;
+}
+function getCryptoMode(mode) {
+  return normalizeSymmetricMode(mode) === "CBC" ? CryptoJS.mode.CBC : CryptoJS.mode.ECB;
+}
+function stripPemHeader(value) {
+  const raw = String(value || "").trim();
+  if (!raw.includes("-----BEGIN")) return raw.replace(/\s+/g, "");
+  return raw.replace(/-----BEGIN [^-]+-----/g, "").replace(/-----END [^-]+-----/g, "").replace(/\s+/g, "");
+}
+function parseRSAKey(value, encoding, fieldName) {
+  const mode = String(encoding || "").trim().toLowerCase();
+  if (mode === "pem") {
+    const body = stripPemHeader(value);
+    const parsed = decodeBase64(body);
+    if (!parsed) return { ok: false, error: `${fieldName} is not valid PEM/base64` };
+    return { ok: true, bytes: parsed };
+  }
+  return parseBytes(value, mode === "hex" ? "hex" : "base64", fieldName);
+}
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch (_err) {
+    return fallback;
+  }
+}
+function toProfileMeta(profile) {
+  return {
+    id: profile.id,
+    name: profile.name,
+    algorithm: profile.algorithm,
+    mode: profile.mode,
+    keySize: profile.keySize,
+    keyEncoding: profile.keyEncoding,
+    ivEncoding: profile.ivEncoding,
+    description: profile.description,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt
+  };
+}
+async function toolCryptoProfileList(args = {}) {
+  const profiles = await loadCryptoProfiles();
+  const includeSecret = !!args.includeSecret;
+  return {
+    ok: true,
+    count: profiles.length,
+    profiles: includeSecret ? profiles : profiles.map((item) => toProfileMeta(item))
+  };
+}
+async function toolCryptoProfileGet(args = {}) {
+  const profiles = await loadCryptoProfiles();
+  const profile = resolveProfileRef(profiles, args);
+  if (!profile) return { ok: false, error: "profile not found" };
+  const includeSecret = args.includeSecret !== false;
+  return { ok: true, profile: includeSecret ? profile : toProfileMeta(profile) };
+}
+async function toolCryptoProfileSave(args = {}) {
+  const name = String(args.name || "").trim();
+  if (!name) return { ok: false, error: "name is required" };
+  const profiles = await loadCryptoProfiles();
+  const now = Date.now();
+  const found = resolveProfileRef(profiles, args);
+  const nextProfile = normalizeCryptoProfile({
+    ...found,
+    ...args,
+    id: normalizeCryptoProfileId(args.id) || found?.id || createCryptoProfileId(),
+    name,
+    createdAt: found?.createdAt || now,
+    updatedAt: now
+  });
+  const next = profiles.filter((item) => item.id !== nextProfile.id);
+  next.push(nextProfile);
+  const saved = await saveCryptoProfiles(next);
+  return { ok: true, profile: nextProfile, count: saved.length };
+}
+async function toolCryptoProfileDelete(args = {}) {
+  const profiles = await loadCryptoProfiles();
+  const targets = resolveProfileRefs(profiles, args);
+  if (!targets.length) {
+    return {
+      ok: false,
+      error: "profile not found, use id/name/index or profileIds/profileNames/indexes/all/query",
+      available: profiles.map((item, idx) => ({ index: idx, id: item.id, name: item.name }))
+    };
+  }
+  const idSet = new Set(targets.map((item) => item.id));
+  const next = profiles.filter((item) => !idSet.has(item.id));
+  const saved = await saveCryptoProfiles(next);
+  return {
+    ok: true,
+    deleted: targets.length === 1 ? targets[0].id : targets.map((item) => item.id),
+    deletedCount: targets.length,
+    count: saved.length
+  };
+}
+async function toolCryptoEncrypt(args = {}) {
+  const profiles = await loadCryptoProfiles();
+  const profile = resolveProfileRef(profiles, args);
+  const cfg = buildSymmetricConfig(args, profile);
+  if (!cfg.keyValue) return { ok: false, error: "key/keyValue is required" };
+  const plainText = String(args.plaintext || args.text || "");
+  const plainEncoding = normalizeCryptoEncoding(args.plainEncoding || args.inputEncoding || "utf8");
+  const outputEncoding = String(args.outputEncoding || "base64").trim().toLowerCase() === "hex" ? "hex" : "base64";
+  const keyParsed = parseBytes(cfg.keyValue, cfg.keyEncoding, "key");
+  if (!keyParsed.ok) return keyParsed;
+  const keyBytes = normalizeToSize(keyParsed.bytes, cfg.keySize);
+  let ivBytes = new Uint8Array([]);
+  if (cfg.mode === "CBC") {
+    const ivParsed = parseBytes(cfg.ivValue, cfg.ivEncoding, "iv");
+    if (!ivParsed.ok) return ivParsed;
+    ivBytes = normalizeToSize(ivParsed.bytes, cfg.algorithm === "AES" ? 128 : 64);
+  }
+  const plainParsed = parseBytes(plainText, plainEncoding, "plaintext");
+  if (!plainParsed.ok) return plainParsed;
+  const options = { mode: getCryptoMode(cfg.mode), padding: CryptoJS.pad.Pkcs7 };
+  if (cfg.mode === "CBC") {
+    options.iv = bytesToWordArray(ivBytes);
+  }
+  try {
+    const engine = getCryptoEngine(cfg.algorithm);
+    const encrypted = engine.encrypt(bytesToWordArray(plainParsed.bytes), bytesToWordArray(keyBytes), options);
+    const ciphertextBytes = wordArrayToBytes(encrypted.ciphertext);
+    return {
+      ok: true,
+      algorithm: cfg.algorithm,
+      mode: cfg.mode,
+      keySize: cfg.keySize,
+      keySizeNote: cfg.keySizeNote || void 0,
+      outputEncoding,
+      ciphertext: formatBytes(ciphertextBytes, outputEncoding),
+      keyHex: encodeHex(keyBytes),
+      ivHex: cfg.mode === "CBC" ? encodeHex(ivBytes) : ""
+    };
+  } catch (err) {
+    return { ok: false, error: `crypto_encrypt failed: ${String(err)}` };
+  }
+}
+async function toolCryptoDecrypt(args = {}) {
+  const profiles = await loadCryptoProfiles();
+  const profile = resolveProfileRef(profiles, args);
+  const cfg = buildSymmetricConfig(args, profile);
+  if (!cfg.keyValue) return { ok: false, error: "key/keyValue is required" };
+  const cipherText = String(args.ciphertext || args.text || "");
+  const cipherEncoding = String(args.cipherEncoding || args.inputEncoding || "base64").trim().toLowerCase() === "hex" ? "hex" : "base64";
+  const outputEncoding = normalizeCryptoEncoding(args.outputEncoding || "utf8");
+  const keyParsed = parseBytes(cfg.keyValue, cfg.keyEncoding, "key");
+  if (!keyParsed.ok) return keyParsed;
+  const keyBytes = normalizeToSize(keyParsed.bytes, cfg.keySize);
+  let ivBytes = new Uint8Array([]);
+  if (cfg.mode === "CBC") {
+    const ivParsed = parseBytes(cfg.ivValue, cfg.ivEncoding, "iv");
+    if (!ivParsed.ok) return ivParsed;
+    ivBytes = normalizeToSize(ivParsed.bytes, cfg.algorithm === "AES" ? 128 : 64);
+  }
+  const cipherParsed = parseBytes(cipherText, cipherEncoding, "ciphertext");
+  if (!cipherParsed.ok) return cipherParsed;
+  const options = { mode: getCryptoMode(cfg.mode), padding: CryptoJS.pad.Pkcs7 };
+  if (cfg.mode === "CBC") {
+    options.iv = bytesToWordArray(ivBytes);
+  }
+  try {
+    const engine = getCryptoEngine(cfg.algorithm);
+    const cp = CryptoJS.lib.CipherParams.create({ ciphertext: bytesToWordArray(cipherParsed.bytes) });
+    const plainWordArray = engine.decrypt(cp, bytesToWordArray(keyBytes), options);
+    const plainBytes = wordArrayToBytes(plainWordArray);
+    return {
+      ok: true,
+      algorithm: cfg.algorithm,
+      mode: cfg.mode,
+      keySize: cfg.keySize,
+      keySizeNote: cfg.keySizeNote || void 0,
+      outputEncoding,
+      plaintext: formatBytes(plainBytes, outputEncoding),
+      keyHex: encodeHex(keyBytes),
+      ivHex: cfg.mode === "CBC" ? encodeHex(ivBytes) : ""
+    };
+  } catch (err) {
+    return { ok: false, error: `crypto_decrypt failed: ${String(err)}` };
+  }
+}
+async function toolCryptoEncryptDirect(args = {}) {
+  const next = { ...args };
+  delete next.profileId;
+  delete next.profileName;
+  return toolCryptoEncrypt(next);
+}
+async function toolCryptoDecryptDirect(args = {}) {
+  const next = { ...args };
+  delete next.profileId;
+  delete next.profileName;
+  return toolCryptoDecrypt(next);
+}
+async function toolRSAEncrypt(args = {}) {
+  const keyEncoding = String(args.publicKeyEncoding || "base64").trim().toLowerCase();
+  const keyParsed = parseRSAKey(args.publicKey || "", keyEncoding, "publicKey");
+  if (!keyParsed.ok) return keyParsed;
+  const inputEncoding = normalizeCryptoEncoding(args.inputEncoding || "utf8");
+  const outputEncoding = String(args.outputEncoding || "base64").trim().toLowerCase() === "hex" ? "hex" : "base64";
+  const hash = String(args.hash || "SHA-256").trim().toUpperCase();
+  const hashName = hash === "SHA-1" || hash === "SHA-384" || hash === "SHA-512" ? hash : "SHA-256";
+  const parsedText = parseBytes(String(args.plaintext || args.text || ""), inputEncoding, "plaintext");
+  if (!parsedText.ok) return parsedText;
+  try {
+    const key = await crypto.subtle.importKey(
+      "spki",
+      keyParsed.bytes.buffer.slice(keyParsed.bytes.byteOffset, keyParsed.bytes.byteOffset + keyParsed.bytes.byteLength),
+      { name: "RSA-OAEP", hash: hashName },
+      false,
+      ["encrypt"]
+    );
+    const encrypted = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, key, parsedText.bytes);
+    return {
+      ok: true,
+      algorithm: "RSA-OAEP",
+      hash: hashName,
+      outputEncoding,
+      ciphertext: formatBytes(new Uint8Array(encrypted), outputEncoding)
+    };
+  } catch (err) {
+    return { ok: false, error: `rsa_encrypt failed: ${String(err)}` };
+  }
+}
+async function toolRSADecrypt(args = {}) {
+  const keyEncoding = String(args.privateKeyEncoding || "base64").trim().toLowerCase();
+  const keyParsed = parseRSAKey(args.privateKey || "", keyEncoding, "privateKey");
+  if (!keyParsed.ok) return keyParsed;
+  const inputEncoding = String(args.inputEncoding || "base64").trim().toLowerCase() === "hex" ? "hex" : "base64";
+  const outputEncoding = normalizeCryptoEncoding(args.outputEncoding || "utf8");
+  const hash = String(args.hash || "SHA-256").trim().toUpperCase();
+  const hashName = hash === "SHA-1" || hash === "SHA-384" || hash === "SHA-512" ? hash : "SHA-256";
+  const parsedCipher = parseBytes(String(args.ciphertext || args.text || ""), inputEncoding, "ciphertext");
+  if (!parsedCipher.ok) return parsedCipher;
+  try {
+    const key = await crypto.subtle.importKey(
+      "pkcs8",
+      keyParsed.bytes.buffer.slice(keyParsed.bytes.byteOffset, keyParsed.bytes.byteOffset + keyParsed.bytes.byteLength),
+      { name: "RSA-OAEP", hash: hashName },
+      false,
+      ["decrypt"]
+    );
+    const decrypted = await crypto.subtle.decrypt({ name: "RSA-OAEP" }, key, parsedCipher.bytes);
+    return {
+      ok: true,
+      algorithm: "RSA-OAEP",
+      hash: hashName,
+      outputEncoding,
+      plaintext: formatBytes(new Uint8Array(decrypted), outputEncoding)
+    };
+  } catch (err) {
+    return { ok: false, error: `rsa_decrypt failed: ${String(err)}` };
+  }
+}
+async function toolRSAEncryptDirect(args = {}) {
+  return toolRSAEncrypt(args);
+}
+async function toolRSADecryptDirect(args = {}) {
+  return toolRSADecrypt(args);
+}
+async function toolRSAGenerateKeypair(args = {}) {
+  const modulusLengthRaw = Number(args.modulusLength || 2048);
+  const modulusLength = modulusLengthRaw === 1024 || modulusLengthRaw === 3072 || modulusLengthRaw === 4096 ? modulusLengthRaw : 2048;
+  const hash = String(args.hash || "SHA-256").trim().toUpperCase();
+  const hashName = hash === "SHA-1" || hash === "SHA-384" || hash === "SHA-512" ? hash : "SHA-256";
+  const outputEncoding = String(args.outputEncoding || "base64").trim().toLowerCase() === "hex" ? "hex" : "base64";
+  try {
+    const keyPair = await crypto.subtle.generateKey(
+      {
+        name: "RSA-OAEP",
+        modulusLength,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: hashName
+      },
+      true,
+      ["encrypt", "decrypt"]
+    );
+    const spki = new Uint8Array(await crypto.subtle.exportKey("spki", keyPair.publicKey));
+    const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", keyPair.privateKey));
+    return {
+      ok: true,
+      algorithm: "RSA-OAEP",
+      modulusLength,
+      hash: hashName,
+      outputEncoding,
+      publicKey: formatBytes(spki, outputEncoding),
+      privateKey: formatBytes(pkcs8, outputEncoding),
+      publicKeyBase64: formatBytes(spki, "base64"),
+      privateKeyBase64: formatBytes(pkcs8, "base64"),
+      publicKeyHex: formatBytes(spki, "hex"),
+      privateKeyHex: formatBytes(pkcs8, "hex")
+    };
+  } catch (err) {
+    return { ok: false, error: `rsa_generate_keypair failed: ${String(err)}` };
+  }
+}
+async function toolEncodingConvert(args = {}) {
+  const fromEncoding = normalizeCryptoEncoding(args.from || args.fromEncoding || "utf8");
+  const toEncoding = normalizeCryptoEncoding(args.to || args.toEncoding || "base64");
+  const text = String(args.text || args.input || "");
+  const parsed = parseBytes(text, fromEncoding, "input");
+  if (!parsed.ok) return parsed;
+  return {
+    ok: true,
+    fromEncoding,
+    toEncoding,
+    input: text,
+    output: formatBytes(parsed.bytes, toEncoding)
+  };
+}
+function normalizeHttpMethod(value) {
+  const method = String(value || "GET").trim().toUpperCase();
+  if (!method) return "GET";
+  return method;
+}
+function normalizeHttpHeaders(value) {
+  if (!value) return {};
+  if (typeof value === "string") {
+    const parsed = safeJsonParse(value, null);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    return {};
+  }
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  return {};
+}
+function buildURLWithQuery(urlText, query) {
+  const u = new URL(String(urlText || ""));
+  if (!query) return u.toString();
+  let queryObj = query;
+  if (typeof query === "string") {
+    queryObj = safeJsonParse(query, null);
+  }
+  if (queryObj && typeof queryObj === "object" && !Array.isArray(queryObj)) {
+    for (const [k, v] of Object.entries(queryObj)) {
+      if (typeof v === "undefined" || v === null) continue;
+      u.searchParams.set(k, String(v));
+    }
+  }
+  return u.toString();
+}
+async function toolHttpRequest(args = {}) {
+  const method = normalizeHttpMethod(args.method);
+  const rawURL = String(args.url || "").trim();
+  if (!rawURL) return { ok: false, error: "url is required" };
+  let finalURL = "";
+  try {
+    finalURL = buildURLWithQuery(rawURL, args.query);
+  } catch (err) {
+    return { ok: false, error: `invalid url: ${String(err)}` };
+  }
+  const headers = normalizeHttpHeaders(args.headers);
+  const timeoutSecRaw = Number(args.timeoutSec || 30);
+  const timeoutSec = Math.min(300, Math.max(3, Number.isFinite(timeoutSecRaw) ? timeoutSecRaw : 30));
+  const responseEncoding = normalizeCryptoEncoding(args.responseEncoding || "utf8");
+  const responseType = String(args.responseType || "text").trim().toLowerCase();
+  const includeResponseHeaders = args.includeResponseHeaders !== false;
+  const maxResponseCharsRaw = Number(args.maxResponseChars || 2e5);
+  const maxResponseChars = Math.min(1e6, Math.max(512, Number.isFinite(maxResponseCharsRaw) ? Math.floor(maxResponseCharsRaw) : 2e5));
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    try {
+      controller.abort();
+    } catch (_err) {
+    }
+  }, timeoutSec * 1e3);
+  try {
+    const fetchOptions = {
+      method,
+      headers,
+      signal: controller.signal
+    };
+    if (method !== "GET" && method !== "HEAD") {
+      const bodyType = String(args.bodyType || "auto").trim().toLowerCase();
+      const body = args.body;
+      if (bodyType === "json") {
+        fetchOptions.body = typeof body === "string" ? body : JSON.stringify(body ?? {});
+        if (!fetchOptions.headers["Content-Type"] && !fetchOptions.headers["content-type"]) {
+          fetchOptions.headers["Content-Type"] = "application/json";
+        }
+      } else if (typeof body !== "undefined") {
+        fetchOptions.body = typeof body === "string" ? body : JSON.stringify(body);
+      }
+    }
+    const resp = await fetch(finalURL, fetchOptions);
+    const respHeaders = {};
+    if (includeResponseHeaders) {
+      resp.headers.forEach((value, key) => {
+        respHeaders[key] = value;
+      });
+    }
+    let output = "";
+    if (responseType === "arraybuffer" || responseType === "base64" || responseType === "hex") {
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      if (responseType === "hex") {
+        output = formatBytes(buf, "hex");
+      } else {
+        output = formatBytes(buf, "base64");
+      }
+    } else if (responseType === "json") {
+      const json = await resp.json().catch(() => null);
+      output = JSON.stringify(json, null, 2);
+    } else {
+      const txt = await resp.text();
+      const clipped = txt.length > maxResponseChars ? `${txt.slice(0, maxResponseChars)} ...(truncated ${txt.length - maxResponseChars} chars)` : txt;
+      if (responseEncoding === "utf8") {
+        output = clipped;
+      } else {
+        output = formatBytes(new TextEncoder().encode(clipped), responseEncoding);
+      }
+    }
+    return {
+      ok: true,
+      url: finalURL,
+      method,
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: respHeaders,
+      body: output
+    };
+  } catch (err) {
+    return { ok: false, error: `http_request failed: ${String(err)}`, url: finalURL, method };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+function secureRandomUint32() {
+  const arr = new Uint32Array(1);
+  crypto.getRandomValues(arr);
+  return arr[0] >>> 0;
+}
+function randomIntInRange(min, max) {
+  const lo = Math.ceil(Number(min));
+  const hi = Math.floor(Number(max));
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) {
+    throw new Error("invalid range");
+  }
+  const range = hi - lo + 1;
+  if (range <= 0) {
+    throw new Error("range too large");
+  }
+  const maxUint = 4294967296;
+  const limit = maxUint - maxUint % range;
+  let x = 0;
+  do {
+    x = secureRandomUint32();
+  } while (x >= limit);
+  return lo + x % range;
+}
+function randomFloatInRange(min, max) {
+  const lo = Number(min);
+  const hi = Number(max);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) {
+    throw new Error("invalid range");
+  }
+  const arr = new Uint32Array(1);
+  crypto.getRandomValues(arr);
+  const unit = arr[0] / 4294967295;
+  return lo + (hi - lo) * unit;
+}
+function randomBytes(size) {
+  const n = Math.max(1, Math.floor(Number(size || 16)));
+  const out = new Uint8Array(n);
+  crypto.getRandomValues(out);
+  return out;
+}
+function bytesToUuidV4(bytes16) {
+  const b = bytes16 instanceof Uint8Array ? bytes16.slice(0, 16) : randomBytes(16);
+  b[6] = b[6] & 15 | 64;
+  b[8] = b[8] & 63 | 128;
+  const hex = encodeHex(b);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+function buildRandomCharset(args = {}) {
+  const custom = String(args.customChars || args.chars || "");
+  if (custom) return custom;
+  const type = String(args.charset || "alnum").trim().toLowerCase();
+  if (type === "numeric" || type === "number" || type === "digits") return "0123456789";
+  if (type === "alpha" || type === "letters") return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  if (type === "lower") return "abcdefghijklmnopqrstuvwxyz";
+  if (type === "upper") return "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  if (type === "hex") return "0123456789abcdef";
+  if (type === "base64") return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (type === "base64url") return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+}
+async function toolRandomUUID() {
+  const value = bytesToUuidV4(randomBytes(16));
+  return { ok: true, uuid: value };
+}
+async function toolRandomUUID32() {
+  const value = bytesToUuidV4(randomBytes(16)).replace(/-/g, "");
+  return { ok: true, uuid32: value };
+}
+async function toolRandomString(args = {}) {
+  const length = Math.max(1, Math.min(4096, Math.floor(Number(args.length || 16))));
+  const chars = buildRandomCharset(args);
+  if (!chars) return { ok: false, error: "charset is empty" };
+  const uniq = Array.from(new Set(chars.split("")));
+  if (uniq.length === 0) return { ok: false, error: "charset is empty" };
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    const idx = randomIntInRange(0, uniq.length - 1);
+    out += uniq[idx];
+  }
+  return {
+    ok: true,
+    length,
+    charset: String(args.charset || (args.customChars ? "custom" : "alnum")),
+    value: out
+  };
+}
+async function toolRandomNumber(args = {}) {
+  const min = Number(Object.prototype.hasOwnProperty.call(args, "min") ? args.min : 0);
+  const max = Number(Object.prototype.hasOwnProperty.call(args, "max") ? args.max : 100);
+  const integer = args.integer !== false;
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) {
+    return { ok: false, error: "invalid range: min/max" };
+  }
+  if (integer) {
+    try {
+      const value = randomIntInRange(min, max);
+      return { ok: true, min, max, integer: true, value };
+    } catch (err) {
+      return { ok: false, error: `random_number failed: ${String(err)}` };
+    }
+  }
+  const precisionRaw = Number(args.precision);
+  const precision = Number.isFinite(precisionRaw) ? Math.max(0, Math.min(12, Math.floor(precisionRaw))) : null;
+  try {
+    let value = randomFloatInRange(min, max);
+    if (precision !== null) {
+      value = Number(value.toFixed(precision));
+    }
+    return { ok: true, min, max, integer: false, precision: precision === null ? void 0 : precision, value };
+  } catch (err) {
+    return { ok: false, error: `random_number failed: ${String(err)}` };
+  }
+}
+function normalizeDigestAlgorithm(value) {
+  const raw = String(value || "").trim().toUpperCase().replace(/-/g, "");
+  if (raw === "MD5") return "MD5";
+  if (raw === "SHA1") return "SHA1";
+  if (raw === "SHA256") return "SHA256";
+  if (raw === "SHA512") return "SHA512";
+  return "SHA256";
+}
+function computeDigestWordArray(algorithm, wordArray) {
+  const algo = normalizeDigestAlgorithm(algorithm);
+  if (algo === "MD5") return CryptoJS.MD5(wordArray);
+  if (algo === "SHA1") return CryptoJS.SHA1(wordArray);
+  if (algo === "SHA512") return CryptoJS.SHA512(wordArray);
+  return CryptoJS.SHA256(wordArray);
+}
+function computeHmacWordArray(algorithm, messageWordArray, keyWordArray) {
+  const algo = normalizeDigestAlgorithm(algorithm);
+  if (algo === "MD5") return CryptoJS.HmacMD5(messageWordArray, keyWordArray);
+  if (algo === "SHA1") return CryptoJS.HmacSHA1(messageWordArray, keyWordArray);
+  if (algo === "SHA512") return CryptoJS.HmacSHA512(messageWordArray, keyWordArray);
+  return CryptoJS.HmacSHA256(messageWordArray, keyWordArray);
+}
+async function toolHashDigest(args = {}) {
+  const text = String(args.text || args.input || "");
+  const inputEncoding = normalizeCryptoEncoding(args.inputEncoding || "utf8");
+  const outputEncoding = String(args.outputEncoding || "hex").trim().toLowerCase() === "base64" ? "base64" : "hex";
+  const parsed = parseBytes(text, inputEncoding, "input");
+  if (!parsed.ok) return parsed;
+  try {
+    const digestWordArray = computeDigestWordArray(args.algorithm || "SHA256", bytesToWordArray(parsed.bytes));
+    const digestBytes = wordArrayToBytes(digestWordArray);
+    return {
+      ok: true,
+      algorithm: normalizeDigestAlgorithm(args.algorithm || "SHA256"),
+      inputEncoding,
+      outputEncoding,
+      digest: formatBytes(digestBytes, outputEncoding)
+    };
+  } catch (err) {
+    return { ok: false, error: `hash_digest failed: ${String(err)}` };
+  }
+}
+async function toolHmacSign(args = {}) {
+  const text = String(args.text || args.input || "");
+  const key = String(args.key || "");
+  if (!key) return { ok: false, error: "key is required" };
+  const inputEncoding = normalizeCryptoEncoding(args.inputEncoding || "utf8");
+  const keyEncoding = normalizeCryptoEncoding(args.keyEncoding || "utf8");
+  const outputEncoding = String(args.outputEncoding || "hex").trim().toLowerCase() === "base64" ? "base64" : "hex";
+  const parsedText = parseBytes(text, inputEncoding, "input");
+  if (!parsedText.ok) return parsedText;
+  const parsedKey = parseBytes(key, keyEncoding, "key");
+  if (!parsedKey.ok) return parsedKey;
+  try {
+    const macWordArray = computeHmacWordArray(
+      args.algorithm || "SHA256",
+      bytesToWordArray(parsedText.bytes),
+      bytesToWordArray(parsedKey.bytes)
+    );
+    const macBytes = wordArrayToBytes(macWordArray);
+    return {
+      ok: true,
+      algorithm: normalizeDigestAlgorithm(args.algorithm || "SHA256"),
+      inputEncoding,
+      keyEncoding,
+      outputEncoding,
+      hmac: formatBytes(macBytes, outputEncoding)
+    };
+  } catch (err) {
+    return { ok: false, error: `hmac_sign failed: ${String(err)}` };
+  }
+}
+async function toolUrlEncode(args = {}) {
+  const text = String(args.text || "");
+  const component = args.component !== false;
+  try {
+    return { ok: true, encoded: component ? encodeURIComponent(text) : encodeURI(text), component };
+  } catch (err) {
+    return { ok: false, error: `url_encode failed: ${String(err)}` };
+  }
+}
+async function toolUrlDecode(args = {}) {
+  const text = String(args.text || "");
+  const component = args.component !== false;
+  const plusAsSpace = !!args.plusAsSpace;
+  try {
+    const input = plusAsSpace ? text.replace(/\+/g, "%20") : text;
+    return { ok: true, decoded: component ? decodeURIComponent(input) : decodeURI(input), component, plusAsSpace };
+  } catch (err) {
+    return { ok: false, error: `url_decode failed: ${String(err)}` };
+  }
+}
+function decodeBase64URL(text) {
+  const raw = String(text || "").trim().replace(/-/g, "+").replace(/_/g, "/");
+  const pad = raw.length % 4 === 0 ? "" : "=".repeat(4 - raw.length % 4);
+  return decodeBase64(raw + pad);
+}
+function parseJsonLoose(text) {
+  try {
+    return JSON.parse(String(text || ""));
+  } catch (_err) {
+    return null;
+  }
+}
+async function toolJwtDecode(args = {}) {
+  const token = String(args.token || "").trim();
+  if (!token) return { ok: false, error: "token is required" };
+  const parts = token.split(".");
+  if (parts.length < 2) return { ok: false, error: "invalid jwt token" };
+  const headerBytes = decodeBase64URL(parts[0]);
+  const payloadBytes = decodeBase64URL(parts[1]);
+  if (!headerBytes || !payloadBytes) return { ok: false, error: "invalid base64url in jwt" };
+  const headerText = new TextDecoder().decode(headerBytes);
+  const payloadText = new TextDecoder().decode(payloadBytes);
+  return {
+    ok: true,
+    header: parseJsonLoose(headerText) ?? headerText,
+    payload: parseJsonLoose(payloadText) ?? payloadText,
+    signature: parts[2] || "",
+    validFormat: parts.length >= 3
+  };
+}
+function parseJsonPath(pathText) {
+  const path = String(pathText || "").trim();
+  if (!path || path[0] !== "$") return { ok: false, error: "jsonpath must start with $" };
+  const tokens = [];
+  let i = 1;
+  while (i < path.length) {
+    const ch = path[i];
+    if (ch === ".") {
+      i += 1;
+      if (path[i] === "*") {
+        tokens.push({ type: "wildcard" });
+        i += 1;
+        continue;
+      }
+      let j = i;
+      while (j < path.length && /[A-Za-z0-9_$-]/.test(path[j])) j += 1;
+      if (j === i) return { ok: false, error: `invalid token near . at ${i}` };
+      tokens.push({ type: "prop", key: path.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (ch === "[") {
+      i += 1;
+      if (path[i] === "*") {
+        i += 1;
+        if (path[i] !== "]") return { ok: false, error: "expected ] after [*]" };
+        tokens.push({ type: "wildcard" });
+        i += 1;
+        continue;
+      }
+      if (path[i] === "'" || path[i] === '"') {
+        const quote = path[i];
+        i += 1;
+        let j = i;
+        while (j < path.length && path[j] !== quote) j += 1;
+        if (j >= path.length) return { ok: false, error: "unterminated quoted property" };
+        const key = path.slice(i, j);
+        j += 1;
+        if (path[j] !== "]") return { ok: false, error: "expected ] after quoted property" };
+        tokens.push({ type: "prop", key });
+        i = j + 1;
+        continue;
+      }
+      let j = i;
+      while (j < path.length && /[-0-9]/.test(path[j])) j += 1;
+      const indexText = path.slice(i, j);
+      if (!indexText || !/^-?\d+$/.test(indexText)) return { ok: false, error: `invalid array index near ${i}` };
+      if (path[j] !== "]") return { ok: false, error: "expected ] after index" };
+      tokens.push({ type: "index", index: Number(indexText) });
+      i = j + 1;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      i += 1;
+      continue;
+    }
+    return { ok: false, error: `unexpected token '${ch}' at ${i}` };
+  }
+  return { ok: true, tokens };
+}
+function applyJsonPath(root, tokens) {
+  let nodes = [root];
+  for (const token of tokens) {
+    const next = [];
+    for (const node of nodes) {
+      if (token.type === "prop") {
+        if (node && typeof node === "object" && Object.prototype.hasOwnProperty.call(node, token.key)) {
+          next.push(node[token.key]);
+        }
+      } else if (token.type === "index") {
+        if (Array.isArray(node)) {
+          const idx = token.index < 0 ? node.length + token.index : token.index;
+          if (idx >= 0 && idx < node.length) next.push(node[idx]);
+        }
+      } else if (token.type === "wildcard") {
+        if (Array.isArray(node)) {
+          for (const item of node) next.push(item);
+        } else if (node && typeof node === "object") {
+          for (const value of Object.values(node)) next.push(value);
+        }
+      }
+    }
+    nodes = next;
+  }
+  return nodes;
+}
+async function toolJsonpathQuery(args = {}) {
+  const path = String(args.path || "").trim();
+  if (!path) return { ok: false, error: "path is required" };
+  let input = args.json;
+  if (typeof input === "string") {
+    input = safeJsonParse(input, null);
+  }
+  if (typeof input === "undefined" || input === null) {
+    return { ok: false, error: "json input is required" };
+  }
+  const parsed = parseJsonPath(path);
+  if (!parsed.ok) return parsed;
+  const results = applyJsonPath(input, parsed.tokens);
+  const firstOnly = !!args.firstOnly;
+  return {
+    ok: true,
+    path,
+    count: results.length,
+    result: firstOnly ? results[0] ?? null : results
+  };
+}
+async function toolRegexExtract(args = {}) {
+  const text = String(args.text || "");
+  const pattern = String(args.pattern || "");
+  if (!pattern) return { ok: false, error: "pattern is required" };
+  const rawFlags = String(args.flags || "").toLowerCase().replace(/[^gimsuy]/g, "");
+  const all = args.all !== false;
+  const group = Number.isFinite(Number(args.group)) ? Number(args.group) : 0;
+  const limitRaw = Number(args.limit || 50);
+  const limit = Math.max(1, Math.min(500, Number.isFinite(limitRaw) ? Math.floor(limitRaw) : 50));
+  try {
+    if (!all) {
+      const reg = new RegExp(pattern, rawFlags.replace(/g/g, ""));
+      const m = reg.exec(text);
+      if (!m) return { ok: true, matched: false, match: null };
+      return {
+        ok: true,
+        matched: true,
+        match: {
+          index: m.index,
+          full: m[0],
+          groups: Array.from(m).slice(1),
+          value: typeof m[group] === "undefined" ? null : m[group]
+        }
+      };
+    }
+    const flags = rawFlags.includes("g") ? rawFlags : `${rawFlags}g`;
+    const reg = new RegExp(pattern, flags);
+    const list = [];
+    let m;
+    while ((m = reg.exec(text)) && list.length < limit) {
+      list.push({
+        index: m.index,
+        full: m[0],
+        groups: Array.from(m).slice(1),
+        value: typeof m[group] === "undefined" ? null : m[group]
+      });
+      if (m[0] === "") {
+        reg.lastIndex += 1;
+      }
+    }
+    return { ok: true, matched: list.length > 0, count: list.length, matches: list };
+  } catch (err) {
+    return { ok: false, error: `regex_extract failed: ${String(err)}` };
+  }
+}
+function maskSecret(value) {
+  const raw = String(value || "");
+  if (!raw) return "";
+  if (raw.length <= 8) return "****";
+  return `${raw.slice(0, 3)}***${raw.slice(-3)}`;
+}
+function findMcpServiceByArgs(list, args = {}) {
+  const id = String(args.serviceId || args.id || "").trim();
+  const name = String(args.serviceName || args.name || "").trim().toLowerCase();
+  const index = Number(args.index);
+  if (id) {
+    const item = list.find((x) => x.id === id);
+    if (item) return item;
+  }
+  if (name) {
+    const item = list.find((x) => String(x.name || "").trim().toLowerCase() === name);
+    if (item) return item;
+  }
+  if (Number.isInteger(index) && index >= 0 && index < list.length) {
+    return list[index];
+  }
+  return null;
+}
+function pickMcpPayload(args = {}) {
+  if (args.service && typeof args.service === "object" && !Array.isArray(args.service)) {
+    return args.service;
+  }
+  const out = {};
+  const fields = ["id", "name", "enabled", "transport", "baseURL", "apiKey", "command", "args", "envText"];
+  for (const field of fields) {
+    if (Object.prototype.hasOwnProperty.call(args, field)) {
+      out[field] = args[field];
+    }
+  }
+  return out;
+}
+async function toolMcpServiceList(args = {}) {
+  const settings = await getSettings();
+  const includeSecret = !!args.includeSecret;
+  const list = normalizeMcpServices(settings.mcpServices || []);
+  const services = includeSecret ? list : list.map((item) => ({
+    ...item,
+    apiKey: maskSecret(item.apiKey)
+  }));
+  return { ok: true, count: services.length, services };
+}
+async function toolMcpServiceUpsert(args = {}) {
+  const settings = await getSettings();
+  const current = normalizeMcpServices(settings.mcpServices || []);
+  const payload = pickMcpPayload(args);
+  const found = findMcpServiceByArgs(current, args);
+  const requestedName = String(args.serviceName || "").trim();
+  const merged = normalizeMcpService({
+    ...(found || {}),
+    ...payload,
+    name: String(payload.name || requestedName || found?.name || ""),
+    id: String(payload.id || found?.id || createMcpServiceId())
+  });
+  if (!String(merged.name || "").trim()) {
+    merged.name = `MCP-${merged.transport}-${merged.id.slice(-6)}`;
+  }
+  const next = current.filter((item) => item.id !== merged.id);
+  next.push(merged);
+  await saveSettings({ ...(settings || {}), mcpServices: next });
+  return { ok: true, action: found ? "updated" : "created", service: merged, count: next.length };
+}
+async function toolMcpServiceSetEnabled(args = {}) {
+  const settings = await getSettings();
+  const current = normalizeMcpServices(settings.mcpServices || []);
+  const found = findMcpServiceByArgs(current, args);
+  if (!found) return { ok: false, error: "mcp service not found" };
+  const enabled = args.enabled !== false;
+  const next = current.map((item) => item.id === found.id ? { ...item, enabled } : item);
+  await saveSettings({ ...(settings || {}), mcpServices: next });
+  return { ok: true, serviceId: found.id, enabled };
+}
+async function toolMcpServiceTest(args = {}) {
+  const settings = await getSettings();
+  const current = normalizeMcpServices(settings.mcpServices || []);
+  let service = null;
+  if (args.service && typeof args.service === "object") {
+    service = normalizeMcpService(args.service);
+  } else {
+    service = findMcpServiceByArgs(current, args);
+  }
+  if (!service) return { ok: false, error: "mcp service not found" };
+  const result = await fetchMCPToolsForService(service);
+  if (!result.ok) {
+    return { ok: false, service: { id: service.id, name: service.name, transport: service.transport, baseURL: service.baseURL }, error: result.error || "test failed" };
+  }
+  const tools = Array.isArray(result.tools) ? result.tools : [];
+  return {
+    ok: true,
+    service: { id: service.id, name: service.name, transport: service.transport, baseURL: service.baseURL },
+    toolCount: tools.length,
+    toolNames: tools.map((t) => String(t?.name || "").trim()).filter(Boolean).slice(0, 200)
+  };
+}
+async function toolClickElement(tabId, args = {}) {
+  const selector = String(args.selector || "button,a,[role='button'],input[type='button'],input[type='submit']").trim();
+  const text = String(args.text || "").trim();
+  const exact = !!args.exact;
+  const all = !!args.all;
+  const index = Math.max(0, Number.isFinite(Number(args.index)) ? Math.floor(Number(args.index)) : 0);
+  const visibleOnly = args.visibleOnly !== false;
+  if (!selector) return { ok: false, error: "selector is required" };
+  return execOnTab(tabId, (sel, targetText, useExact, clickAll, idx, onlyVisible) => {
+    const normalize = (v) => String(v || "").replace(/\s+/g, " ").trim();
+    const isVisible = (el) => {
+      if (!onlyVisible) return true;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const getText = (el) => normalize(el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "");
+    const getSelector = (el) => {
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      const parts = [];
+      let cur = el;
+      while (cur && cur.nodeType === 1 && parts.length < 6) {
+        let part = cur.tagName.toLowerCase();
+        if (cur.classList?.length) {
+          part += "." + Array.from(cur.classList).slice(0, 2).map((x) => CSS.escape(x)).join(".");
+        }
+        if (cur.parentElement) {
+          const same = Array.from(cur.parentElement.children).filter((n) => n.tagName === cur.tagName);
+          if (same.length > 1) part += `:nth-of-type(${same.indexOf(cur) + 1})`;
+        }
+        parts.unshift(part);
+        cur = cur.parentElement;
+      }
+      return parts.join(" > ");
+    };
+    let list = Array.from(document.querySelectorAll(sel)).filter((el) => isVisible(el));
+    if (targetText) {
+      list = list.filter((el) => {
+        const t = getText(el);
+        return useExact ? t === targetText : t.includes(targetText);
+      });
+    }
+    if (!list.length) return { ok: false, error: "no element matched" };
+    const targets = clickAll ? list : [list[Math.min(idx, list.length - 1)]];
+    let clicked = 0;
+    const details = [];
+    for (const el of targets) {
+      try {
+        el.scrollIntoView({ behavior: "auto", block: "center", inline: "center" });
+      } catch (_err) {
+      }
+      try {
+        el.click();
+        clicked += 1;
+        details.push({ tag: el.tagName.toLowerCase(), text: getText(el).slice(0, 200), selector: getSelector(el) });
+      } catch (_err) {
+      }
+    }
+    return { ok: true, clicked, matches: list.length, targets: details };
+  }, [selector, text, exact, all, index, visibleOnly]);
+}
+async function toolInputText(tabId, args = {}) {
+  const selector = String(args.selector || "").trim();
+  const text = String(args.text || "");
+  const append = !!args.append;
+  const all = !!args.all;
+  const index = Math.max(0, Number.isFinite(Number(args.index)) ? Math.floor(Number(args.index)) : 0);
+  if (!selector) return { ok: false, error: "selector is required" };
+  return execOnTab(tabId, (sel, value, doAppend, inputAll, idx) => {
+    const list = Array.from(document.querySelectorAll(sel));
+    if (!list.length) return { ok: false, error: "no element matched" };
+    const targets = inputAll ? list : [list[Math.min(idx, list.length - 1)]];
+    let updated = 0;
+    const details = [];
+    for (const el of targets) {
+      let oldValue = "";
+      let nextValue = "";
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+        oldValue = String(el.value || "");
+        nextValue = doAppend ? oldValue + value : value;
+        el.focus();
+        el.value = nextValue;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        updated += 1;
+      } else if (el && el.isContentEditable) {
+        oldValue = String(el.innerText || "");
+        nextValue = doAppend ? oldValue + value : value;
+        el.focus();
+        el.innerText = nextValue;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        updated += 1;
+      }
+      details.push({
+        tag: el?.tagName?.toLowerCase?.() || "",
+        oldValue: oldValue.slice(0, 200),
+        newValue: nextValue.slice(0, 200)
+      });
+    }
+    return { ok: true, updated, matches: list.length, targets: details };
+  }, [selector, text, append, all, index]);
+}
+async function toolSelectOption(tabId, args = {}) {
+  const selector = String(args.selector || "").trim();
+  const byValue = Object.prototype.hasOwnProperty.call(args, "value") ? String(args.value || "") : "";
+  const byText = Object.prototype.hasOwnProperty.call(args, "text") ? String(args.text || "") : "";
+  const byIndex = Number.isFinite(Number(args.optionIndex)) ? Math.floor(Number(args.optionIndex)) : null;
+  const all = !!args.all;
+  const index = Math.max(0, Number.isFinite(Number(args.index)) ? Math.floor(Number(args.index)) : 0);
+  if (!selector) return { ok: false, error: "selector is required" };
+  return execOnTab(tabId, (sel, value, text, optionIndex, selectAll, idx) => {
+    const list = Array.from(document.querySelectorAll(sel)).filter((el) => el instanceof HTMLSelectElement);
+    if (!list.length) return { ok: false, error: "no select matched" };
+    const targets = selectAll ? list : [list[Math.min(idx, list.length - 1)]];
+    let updated = 0;
+    const details = [];
+    for (const el of targets) {
+      let selectedIndex = -1;
+      if (Number.isInteger(optionIndex) && optionIndex >= 0 && optionIndex < el.options.length) {
+        selectedIndex = optionIndex;
+      } else if (value) {
+        selectedIndex = Array.from(el.options).findIndex((opt) => String(opt.value) === value);
+      } else if (text) {
+        selectedIndex = Array.from(el.options).findIndex((opt) => String(opt.text || "").trim() === text);
+      } else {
+        selectedIndex = 0;
+      }
+      if (selectedIndex >= 0) {
+        el.selectedIndex = selectedIndex;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        updated += 1;
+        const opt = el.options[selectedIndex];
+        details.push({
+          selectedIndex,
+          selectedValue: String(opt?.value || ""),
+          selectedText: String(opt?.text || "")
+        });
+      }
+    }
+    return { ok: true, updated, matches: list.length, targets: details };
+  }, [selector, byValue, byText, byIndex, all, index]);
+}
+async function toolScrollTo(tabId, args = {}) {
+  const selector = String(args.selector || "").trim();
+  const top = Number(args.top);
+  const left = Number(args.left);
+  const behavior = String(args.behavior || "auto").trim().toLowerCase() === "smooth" ? "smooth" : "auto";
+  return execOnTab(tabId, (sel, y, x, scrollBehavior) => {
+    if (sel) {
+      const el = document.querySelector(sel);
+      if (!el) return { ok: false, error: "selector not found" };
+      el.scrollIntoView({ behavior: scrollBehavior, block: "center", inline: "center" });
+      const rect = el.getBoundingClientRect();
+      return { ok: true, mode: "element", rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, scroll: { x: window.scrollX, y: window.scrollY } };
+    }
+    const nextTop = Number.isFinite(y) ? y : window.scrollY;
+    const nextLeft = Number.isFinite(x) ? x : window.scrollX;
+    window.scrollTo({ top: nextTop, left: nextLeft, behavior: scrollBehavior });
+    return { ok: true, mode: "position", scroll: { x: window.scrollX, y: window.scrollY } };
+  }, [selector, top, left, behavior]);
+}
+async function toolQueryByText(tabId, args = {}) {
+  const text = String(args.text || "").trim();
+  if (!text) return { ok: false, error: "text is required" };
+  const selector = String(args.selector || "*").trim() || "*";
+  const exact = !!args.exact;
+  const ignoreCase = args.ignoreCase !== false;
+  const limit = Math.max(1, Math.min(200, Number.isFinite(Number(args.limit)) ? Math.floor(Number(args.limit)) : 20));
+  return execOnTab(tabId, (targetText, sel, useExact, ci, maxCount) => {
+    const norm = (v) => String(v || "").replace(/\s+/g, " ").trim();
+    const match = (value) => {
+      const a = ci ? norm(value).toLowerCase() : norm(value);
+      const b = ci ? targetText.toLowerCase() : targetText;
+      return useExact ? a === b : a.includes(b);
+    };
+    const getSelector = (el) => {
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      const parts = [];
+      let cur = el;
+      while (cur && cur.nodeType === 1 && parts.length < 6) {
+        let part = cur.tagName.toLowerCase();
+        if (cur.classList?.length) {
+          part += "." + Array.from(cur.classList).slice(0, 2).map((x) => CSS.escape(x)).join(".");
+        }
+        parts.unshift(part);
+        cur = cur.parentElement;
+      }
+      return parts.join(" > ");
+    };
+    const skipTags = new Set(["script", "style", "noscript"]);
+    const out = [];
+    const nodes = Array.from(document.querySelectorAll(sel));
+    for (const el of nodes) {
+      const tag = String(el.tagName || "").toLowerCase();
+      if (skipTags.has(tag)) continue;
+      const value = norm(el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "");
+      if (!value) continue;
+      if (!match(value)) continue;
+      out.push({
+        tag,
+        text: value.slice(0, 260),
+        selector: getSelector(el)
+      });
+      if (out.length >= maxCount) break;
+    }
+    return { ok: true, count: out.length, items: out };
+  }, [text, selector, exact, ignoreCase, limit]);
+}
+async function toolExtractTable(tabId, args = {}) {
+  const selector = String(args.selector || "table").trim() || "table";
+  const maxTables = Math.max(1, Math.min(20, Number.isFinite(Number(args.maxTables)) ? Math.floor(Number(args.maxTables)) : 5));
+  const maxRows = Math.max(1, Math.min(500, Number.isFinite(Number(args.maxRows)) ? Math.floor(Number(args.maxRows)) : 100));
+  return execOnTab(tabId, (sel, tableLimit, rowLimit) => {
+    const norm = (v) => String(v || "").replace(/\s+/g, " ").trim();
+    const getSelector = (el) => {
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      const parts = [];
+      let cur = el;
+      while (cur && cur.nodeType === 1 && parts.length < 6) {
+        let part = cur.tagName.toLowerCase();
+        if (cur.classList?.length) part += "." + Array.from(cur.classList).slice(0, 2).map((x) => CSS.escape(x)).join(".");
+        parts.unshift(part);
+        cur = cur.parentElement;
+      }
+      return parts.join(" > ");
+    };
+    const tables = Array.from(document.querySelectorAll(sel)).filter((el) => el.tagName?.toLowerCase() === "table").slice(0, tableLimit);
+    const items = tables.map((table) => {
+      const headers = Array.from(table.querySelectorAll("thead th")).map((th) => norm(th.innerText || th.textContent || ""));
+      const rows = [];
+      const trs = Array.from(table.querySelectorAll("tbody tr, tr")).slice(0, rowLimit);
+      for (const tr of trs) {
+        const cells = Array.from(tr.querySelectorAll("th,td")).map((cell) => norm(cell.innerText || cell.textContent || ""));
+        if (cells.length) rows.push(cells);
+      }
+      return {
+        selector: getSelector(table),
+        caption: norm(table.querySelector("caption")?.innerText || ""),
+        headers,
+        rowCount: rows.length,
+        rows
+      };
+    });
+    return { ok: true, count: items.length, tables: items };
+  }, [selector, maxTables, maxRows]);
+}
+async function toolExtractFormSchema(tabId, args = {}) {
+  const selector = String(args.selector || "form").trim() || "form";
+  const maxForms = Math.max(1, Math.min(50, Number.isFinite(Number(args.maxForms)) ? Math.floor(Number(args.maxForms)) : 10));
+  const maxFields = Math.max(1, Math.min(1000, Number.isFinite(Number(args.maxFields)) ? Math.floor(Number(args.maxFields)) : 200));
+  const includeHidden = !!args.includeHidden;
+  return execOnTab(tabId, (sel, formLimit, fieldLimit, withHidden) => {
+    const norm = (v) => String(v || "").replace(/\s+/g, " ").trim();
+    const getSelector = (el) => {
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      const parts = [];
+      let cur = el;
+      while (cur && cur.nodeType === 1 && parts.length < 6) {
+        parts.unshift(cur.tagName.toLowerCase());
+        cur = cur.parentElement;
+      }
+      return parts.join(" > ");
+    };
+    const forms = Array.from(document.querySelectorAll(sel)).filter((el) => el.tagName?.toLowerCase() === "form").slice(0, formLimit);
+    const items = forms.map((form) => {
+      const controls = Array.from(form.querySelectorAll("input,textarea,select,button")).filter((el) => withHidden || String(el.type || "").toLowerCase() !== "hidden").slice(0, fieldLimit);
+      const fields = controls.map((el) => {
+        const isSelect = el.tagName?.toLowerCase() === "select";
+        const options = isSelect ? Array.from(el.options || []).slice(0, 120).map((opt) => ({
+          value: String(opt.value || ""),
+          text: norm(opt.text || "")
+        })) : void 0;
+        return {
+          tag: String(el.tagName || "").toLowerCase(),
+          type: String(el.type || "").toLowerCase(),
+          name: String(el.name || ""),
+          id: String(el.id || ""),
+          required: !!el.required,
+          placeholder: String(el.placeholder || ""),
+          value: String(el.value || ""),
+          label: norm(form.querySelector(`label[for="${CSS.escape(el.id || "")}"]`)?.innerText || ""),
+          options
+        };
+      });
+      return {
+        selector: getSelector(form),
+        action: String(form.getAttribute("action") || ""),
+        method: String(form.getAttribute("method") || "GET").toUpperCase(),
+        fieldCount: fields.length,
+        fields
+      };
+    });
+    return { ok: true, count: items.length, forms: items };
+  }, [selector, maxForms, maxFields, includeHidden]);
+}
+async function toolExtractMetaTags(tabId, args = {}) {
+  const includeOpenGraph = args.includeOpenGraph !== false;
+  const includeTwitter = args.includeTwitter !== false;
+  return execOnTab(tabId, (withOG, withTwitter) => {
+    const norm = (v) => String(v || "").trim();
+    const metas = Array.from(document.querySelectorAll("meta")).map((meta) => ({
+      name: norm(meta.getAttribute("name")),
+      property: norm(meta.getAttribute("property")),
+      httpEquiv: norm(meta.getAttribute("http-equiv")),
+      content: norm(meta.getAttribute("content"))
+    })).filter((item) => item.content);
+    const filtered = metas.filter((item) => {
+      const key = (item.property || item.name || "").toLowerCase();
+      if (!withOG && key.startsWith("og:")) return false;
+      if (!withTwitter && key.startsWith("twitter:")) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      title: document.title || "",
+      canonical: norm(document.querySelector("link[rel='canonical']")?.getAttribute("href")),
+      count: filtered.length,
+      metas: filtered
+    };
+  }, [includeOpenGraph, includeTwitter]);
+}
+async function toolExtractJsonld(tabId, args = {}) {
+  const parse = args.parse !== false;
+  return execOnTab(tabId, (doParse) => {
+    const scripts = Array.from(document.querySelectorAll("script[type='application/ld+json']"));
+    const items = scripts.map((script, idx) => {
+      const raw = String(script.textContent || "").trim();
+      if (!doParse) {
+        return { index: idx, raw };
+      }
+      try {
+        return { index: idx, data: JSON.parse(raw) };
+      } catch (_err) {
+        return { index: idx, raw, parseError: true };
+      }
+    });
+    return { ok: true, count: items.length, items };
+  }, [parse]);
 }
 function buildMemoryMessages(memoryEntries) {
   if (!Array.isArray(memoryEntries) || memoryEntries.length === 0) {
@@ -756,9 +2302,7 @@ async function runAgent(prompt, overrideSettings = {}, hooks = {}) {
   if (!tab?.id) {
     return { ok: false, error: "\u672A\u627E\u5230\u5F53\u524D\u6FC0\u6D3B\u6807\u7B7E\u9875" };
   }
-  if (tab.url?.startsWith("chrome://") || tab.url?.startsWith("edge://")) {
-    return { ok: false, error: "\u6D4F\u89C8\u5668\u5185\u90E8\u9875\u9762\u4E0D\u652F\u6301\u6CE8\u5165\u811A\u672C" };
-  }
+  const tabURL = String(tab.url || "");
   let streamedAssistant = "";
   const agentHooks = {
     ...hooks,
@@ -772,9 +2316,12 @@ async function runAgent(prompt, overrideSettings = {}, hooks = {}) {
   };
   let result;
   if (isWholePageTranslateRequest(cleanPrompt)) {
+    if (isRestrictedBrowserPage(tabURL)) {
+      return { ok: false, error: "\u6D4F\u89C8\u5668\u5185\u90E8\u9875\u9762\u65E0\u6CD5\u8BFB/\u6539 DOM\uFF0C\u6574\u9875\u7FFB\u8BD1\u8BF7\u5728 http/https \u666E\u901A\u7F51\u9875\u6267\u884C" };
+    }
     result = await runWholePageTranslate(cleanPrompt, tab.id, settings, agentHooks);
   } else {
-    result = await runFunctionCallingAgent(cleanPrompt, tab.id, settings, agentHooks);
+    result = await runFunctionCallingAgent(cleanPrompt, tab.id, tabURL, settings, agentHooks);
   }
   const finalText = normalizeMemoryText(result?.message || "");
   const partialText = normalizeMemoryText(streamedAssistant);
@@ -812,13 +2359,29 @@ async function runWholePageTranslate(prompt, tabId, settings, hooks) {
     message: `\u6574\u9875\u7FFB\u8BD1\u5B8C\u6210\uFF0C\u5DF2\u66FF\u6362\u9875\u9762 HTML\u3002\u5F53\u524D\u6807\u9898\uFF1A${replaceRes?.title || "(unknown)"}`
   };
 }
-async function runFunctionCallingAgent(prompt, tabId, settings, hooks) {
-  hooks.onStatus?.("\u52A0\u8F7D\u9875\u9762\u5FEB\u7167...");
-  const snapshot = await collectPageSnapshot(tabId);
+async function runFunctionCallingAgent(prompt, tabId, tabURL, settings, hooks) {
+  const attachPageContext = shouldAttachPageContext(prompt);
+  if (attachPageContext && isRestrictedBrowserPage(tabURL)) {
+    return {
+      ok: false,
+      error: "\u5F53\u524D\u662F\u6D4F\u89C8\u5668\u5185\u90E8\u9875\u9762(chrome:// / edge://)\uFF0C\u4E0D\u652F\u6301\u9875\u9762\u8BFB\u5199\u5DE5\u5177\u3002\u82E5\u53EA\u9700\u901A\u7528 function calling(\u52A0\u89E3\u5BC6/\u7F16\u89E3\u7801/http/mcp)\u8BF7\u76F4\u63A5\u63CF\u8FF0\u4EFB\u52A1\u3002"
+    };
+  }
+  let snapshot = { title: "", url: "", selectedText: "", nodes: [] };
+  if (attachPageContext) {
+    hooks.onStatus?.("\u52A0\u8F7D\u9875\u9762\u5FEB\u7167...");
+    snapshot = await collectPageSnapshot(tabId);
+  } else {
+    hooks.onStatus?.("\u8DF3\u8FC7\u9875\u9762\u5FEB\u7167(\u672C\u8F6E\u6309\u9700\u8C03\u7528\u9875\u9762\u5DE5\u5177)...");
+  }
   const memoryEntries = await getConversationMemory(tabId);
-  return runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, snapshot, memoryEntries);
+  return runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, snapshot, memoryEntries, attachPageContext);
 }
-async function runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, snapshot, memoryEntries) {
+function isRestrictedBrowserPage(url) {
+  const raw = String(url || "").trim().toLowerCase();
+  return raw.startsWith("chrome://") || raw.startsWith("edge://") || raw.startsWith("chrome-extension://");
+}
+async function runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, snapshot, memoryEntries, attachPageContext = true) {
   hooks.onStatus?.("\u52A0\u8F7D\u5DE5\u5177\u5217\u8868...");
   const mcpRegistry = await fetchMCPTools(settings);
   const tools = buildToolSpecs(settings.allowScript, mcpRegistry.toolSpecs || []);
@@ -837,18 +2400,24 @@ async function runFunctionCallingAgentLegacy(prompt, tabId, settings, hooks, sna
   const messages = [
     {
       role: "system",
-      content: buildAgentSystemPrompt(settings.allowScript, !!mcpRegistry.toolSpecs?.length)
+      content: buildAgentSystemPrompt(settings.allowScript, !!mcpRegistry.toolSpecs?.length, { attachPageContext })
     },
     ...buildMemoryMessages(memoryEntries),
     {
       role: "user",
-      content: JSON.stringify({
+      content: JSON.stringify(attachPageContext ? {
         request: prompt,
         page: {
           title: snapshot.title,
           url: snapshot.url,
           selectedText: snapshot.selectedText,
           previewNodes: snapshot.nodes?.slice(0, 40) || []
+        }
+      } : {
+        request: prompt,
+        page: {
+          attached: false,
+          note: "\u672C\u8F6E\u672A\u9884\u8F7D\u9875\u9762\u5FEB\u7167\u3002\u82E5\u4EFB\u52A1\u9700\u8981\u9875\u9762\u4FE1\u606F\uff0C\u8BF7\u5148\u8C03\u7528 get_page_snapshot/query_elements \u518D\u64CD\u4F5C\u3002"
         }
       })
     }
@@ -1153,16 +2722,123 @@ async function runFunctionCallingAgentWithResponsesMCP(prompt, tabId, settings, 
     pendingInput = outputs;
   }
 }
-function buildAgentSystemPrompt(allowScript, hasMCP) {
+function shouldAttachPageContext(prompt) {
+  const text = String(prompt || "").trim().toLowerCase();
+  if (!text) return true;
+  const toolCatalogWords = [
+    "function calling",
+    "function list",
+    "tool list",
+    "tools list",
+    "\u51FD\u6570\u5217\u8868",
+    "\u5DE5\u5177\u5217\u8868",
+    "\u53EF\u7528\u51FD\u6570",
+    "\u6709\u54EA\u4E9B\u51FD\u6570",
+    "\u6709\u54EA\u4E9Bfunction",
+    "\u6709\u54EA\u4E9Btool",
+    "\u6709\u54EA\u4E9Bfunction calling"
+  ];
+  if (toolCatalogWords.some((item) => text.includes(item))) {
+    return false;
+  }
+  const hardNoPage = [
+    "\u4E0D\u8981\u8BFB\u53D6\u9875\u9762",
+    "\u65E0\u9700\u9875\u9762",
+    "\u53EA\u8C03\u51FD\u6570",
+    "\u53EA\u8C03\u7528\u5DE5\u5177",
+    "no page",
+    "without page context"
+  ];
+  if (hardNoPage.some((item) => text.includes(item))) {
+    return false;
+  }
+  const pageWords = [
+    "\u7F51\u9875",
+    "\u9875\u9762",
+    "\u5F53\u524D\u9875",
+    "dom",
+    "\u5143\u7D20",
+    "\u6807\u7B7E",
+    "\u6309\u94AE",
+    "\u94FE\u63A5",
+    "a\u6807\u7B7E",
+    "html",
+    "css",
+    "script",
+    "\u811A\u672C",
+    "\u7FFB\u8BD1",
+    "\u6293\u53D6",
+    "\u63D0\u53D6",
+    "\u603B\u7ED3\u9875\u9762",
+    "\u4FEE\u6539\u9875\u9762",
+    "query",
+    "snapshot",
+    "click",
+    "input",
+    "select",
+    "scroll"
+  ];
+  if (pageWords.some((item) => text.includes(item))) {
+    return true;
+  }
+  const utilityWords = [
+    "function",
+    "functions",
+    "tool",
+    "tools",
+    "function calling",
+    "\u51FD\u6570",
+    "\u5DE5\u5177",
+    "\u5DE5\u5177\u5217\u8868",
+    "\u51FD\u6570\u5217\u8868",
+    "\u53EF\u7528\u51FD\u6570",
+    "\u52A0\u5BC6",
+    "\u89E3\u5BC6",
+    "aes",
+    "des",
+    "desede",
+    "rsa",
+    "base64",
+    "hex",
+    "unicode",
+    "\u7F16\u7801",
+    "\u89E3\u7801",
+    "hash",
+    "hmac",
+    "sha",
+    "md5",
+    "jwt",
+    "jsonpath",
+    "\u6B63\u5219",
+    "regex",
+    "\u968F\u673A",
+    "uuid",
+    "http",
+    "request",
+    "mcp",
+    "\u914D\u7F6E",
+    "profile",
+    "storage"
+  ];
+  if (utilityWords.some((item) => text.includes(item))) {
+    return false;
+  }
+  return false;
+}
+function buildAgentSystemPrompt(allowScript, hasMCP, options = {}) {
+  const attachPageContext = options.attachPageContext !== false;
   return [
-    "\u4F60\u662F\u7F51\u9875\u81EA\u52A8\u5316\u4EE3\u7406\uFF0C\u5FC5\u987B\u4F18\u5148\u901A\u8FC7 tools \u89C2\u5BDF\u5E76\u64CD\u4F5C\u9875\u9762\u3002",
+    "\u4F60\u662F\u7F51\u9875\u81EA\u52A8\u5316\u4EE3\u7406\u3002\u8BF7\u6309\u7528\u6237\u610F\u56FE\u9009\u62E9\u5DE5\u5177\uFF0C\u4E0D\u8981\u673A\u68B0\u5730\u6BCF\u8F6E\u5148\u8BFB\u9875\u9762\u3002",
     "\u89C4\u5219\uFF1A",
-    "1. \u5148\u89C2\u5BDF\u518D\u4FEE\u6539\uFF0C\u4E0D\u8981\u76F2\u6539\u3002",
-    "2. \u5C40\u90E8\u4FEE\u6539\u4F18\u5148\u4F7F\u7528 query/extract/set/remove \u5DE5\u5177\u3002",
-    "3. \u6574\u9875\u7FFB\u8BD1\u8BF7\u4F7F\u7528 translate_whole_page_to_zh\u3002",
+    "1. \u4EC5\u5728\u7528\u6237\u4EFB\u52A1\u660E\u786E\u6D89\u53CA\u7F51\u9875\u5185\u5BB9(\u9605\u8BFB/\u63D0\u53D6/\u4FEE\u6539/DOM/\u7FFB\u8BD1)\u65F6\uFF0C\u624D\u8C03\u7528 get_page_snapshot\u3001query/extract/click/input/select/scroll \u7C7B\u5DE5\u5177\u3002",
+    "2. \u5982\u679C\u4EFB\u52A1\u662F\u901A\u7528\u51FD\u6570(\u52A0\u89E3\u5BC6\u3001\u7F16\u89E3\u7801\u3001hash/hmac\u3001\u968F\u673A\u6570\u3001http\u8BF7\u6C42\u3001MCP/\u914D\u7F6E\u7BA1\u7406)\uFF0C\u4E0D\u8981\u4E3B\u52A8\u8BFB\u9875\u9762\uFF0C\u76F4\u63A5\u8C03\u7528\u5BF9\u5E94 function calling \u5DE5\u5177\u3002",
+    "3. \u5C40\u90E8\u4FEE\u6539\u4F18\u5148\u4F7F\u7528 query/extract/set/remove \u5DE5\u5177\uFF1B\u6574\u9875\u7FFB\u8BD1\u4F7F\u7528 translate_whole_page_to_zh\u3002",
     "3.5 \u9700\u8981\u8DE8\u8F6E\u6B21\u4FDD\u5B58\u6570\u636E\u65F6\u53EF\u7528 set_storage/get_storage\u3002",
-    allowScript ? "4. execute_script/append_script \u53EF\u7528\uFF0C\u4F46\u4EC5\u5728\u5FC5\u8981\u65F6\u4F7F\u7528\u3002" : "4. execute_script/append_script \u7981\u7528\uFF0C\u4E0D\u8981\u8C03\u7528\u3002",
+    "3.6 \u52A0\u89E3\u5BC6/\u7F16\u89E3\u7801/\u7F51\u7EDC\u8BF7\u6C42\u8BF7\u4F18\u5148\u4F7F\u7528 crypto_*, rsa_*, encoding_convert, http_request \u5DE5\u5177\u3002",
+    "3.7 \u9700\u8981\u4EA4\u4E92\u6216\u7ED3\u6784\u5316\u62BD\u53D6\u65F6\u4F18\u5148\u4F7F\u7528 click/input/select/scroll \u4EE5\u53CA extract_table/extract_form_schema/query_by_text/meta/jsonld \u5DE5\u5177\u3002",
+    allowScript ? "4. execute_script/append_script \u4EC5\u5728\u65E0\u5176\u4ED6\u5DE5\u5177\u53EF\u7528\u4E14\u7528\u6237\u660E\u786E\u8981\u6C42\u6267\u884C\u811A\u672C\u65F6\u624D\u80FD\u8C03\u7528\u3002" : "4. execute_script/append_script \u7981\u7528\uFF0C\u4E0D\u8981\u8C03\u7528\u3002",
     hasMCP ? "5. \u5141\u8BB8\u8C03\u7528 MCP \u5DE5\u5177\u8865\u5145\u80FD\u529B\u3002" : "5. \u5F53\u524D\u65E0 MCP \u5DE5\u5177\u3002",
+    attachPageContext ? "6. \u672C\u8F6E\u5DF2\u9644\u5E26\u9875\u9762\u9884\u89C8\u4FE1\u606F\uFF0C\u4EC5\u5728\u4E0D\u8DB3\u65F6\u518D\u8C03\u7528 get_page_snapshot \u8865\u5145\u3002" : "6. \u672C\u8F6E\u672A\u9884\u8F7D\u9875\u9762\u5FEB\u7167\uFF0C\u9664\u975E\u4EFB\u52A1\u5FC5\u987B\u4F9D\u8D56\u9875\u9762\u4FE1\u606F\uFF0C\u5426\u5219\u4E0D\u8981\u8C03\u7528\u9875\u9762\u5DE5\u5177\u3002",
     "\u6700\u540E\u7528\u4E2D\u6587\u56DE\u590D\uFF0C\u8BF4\u660E\u6267\u884C\u6B65\u9AA4\u548C\u7ED3\u679C\u3002"
   ].join("\n");
 }
@@ -1286,6 +2962,485 @@ function buildToolSpecs(allowScript, mcpToolSpecs) {
       required: ["key"],
       additionalProperties: false
     }),
+    defineTool("crypto_encrypt", "Encrypt text with AES/DES/DESede and ECB/CBC", {
+      type: "object",
+      properties: {
+        profileId: { type: "string" },
+        profileName: { type: "string" },
+        algorithm: { type: "string", enum: ["AES", "DES", "DESede"] },
+        mode: { type: "string", enum: ["ECB", "CBC"] },
+        keySize: { type: "integer", enum: [64, 128, 192, 256] },
+        keyEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        key: { type: "string" },
+        ivEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        iv: { type: "string" },
+        plaintext: { type: "string" },
+        plainEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        outputEncoding: { type: "string", enum: ["base64", "hex"] }
+      },
+      required: ["plaintext"],
+      additionalProperties: false
+    }),
+    defineTool("crypto_encrypt_direct", "Encrypt with explicit parameters only (no profile)", {
+      type: "object",
+      properties: {
+        algorithm: { type: "string", enum: ["AES", "DES", "DESede"] },
+        mode: { type: "string", enum: ["ECB", "CBC"] },
+        keySize: { type: "integer", enum: [64, 128, 192, 256] },
+        keyEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        key: { type: "string" },
+        ivEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        iv: { type: "string" },
+        plaintext: { type: "string" },
+        plainEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        outputEncoding: { type: "string", enum: ["base64", "hex"] }
+      },
+      required: ["algorithm", "mode", "keyEncoding", "key", "plaintext"],
+      additionalProperties: false
+    }),
+    defineTool("crypto_decrypt", "Decrypt AES/DES/DESede ciphertext", {
+      type: "object",
+      properties: {
+        profileId: { type: "string" },
+        profileName: { type: "string" },
+        algorithm: { type: "string", enum: ["AES", "DES", "DESede"] },
+        mode: { type: "string", enum: ["ECB", "CBC"] },
+        keySize: { type: "integer", enum: [64, 128, 192, 256] },
+        keyEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        key: { type: "string" },
+        ivEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        iv: { type: "string" },
+        ciphertext: { type: "string" },
+        cipherEncoding: { type: "string", enum: ["base64", "hex"] },
+        outputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] }
+      },
+      required: ["ciphertext"],
+      additionalProperties: false
+    }),
+    defineTool("crypto_decrypt_direct", "Decrypt with explicit parameters only (no profile)", {
+      type: "object",
+      properties: {
+        algorithm: { type: "string", enum: ["AES", "DES", "DESede"] },
+        mode: { type: "string", enum: ["ECB", "CBC"] },
+        keySize: { type: "integer", enum: [64, 128, 192, 256] },
+        keyEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        key: { type: "string" },
+        ivEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        iv: { type: "string" },
+        ciphertext: { type: "string" },
+        cipherEncoding: { type: "string", enum: ["base64", "hex"] },
+        outputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] }
+      },
+      required: ["algorithm", "mode", "keyEncoding", "key", "ciphertext"],
+      additionalProperties: false
+    }),
+    defineTool("rsa_encrypt", "Encrypt with RSA public key (RSA-OAEP)", {
+      type: "object",
+      properties: {
+        publicKey: { type: "string" },
+        publicKeyEncoding: { type: "string", enum: ["base64", "hex", "pem"] },
+        plaintext: { type: "string" },
+        inputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        outputEncoding: { type: "string", enum: ["base64", "hex"] },
+        hash: { type: "string", enum: ["SHA-1", "SHA-256", "SHA-384", "SHA-512"] }
+      },
+      required: ["publicKey", "plaintext"],
+      additionalProperties: false
+    }),
+    defineTool("rsa_encrypt_direct", "Encrypt with explicit RSA public key parameters", {
+      type: "object",
+      properties: {
+        publicKey: { type: "string" },
+        publicKeyEncoding: { type: "string", enum: ["base64", "hex", "pem"] },
+        plaintext: { type: "string" },
+        inputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        outputEncoding: { type: "string", enum: ["base64", "hex"] },
+        hash: { type: "string", enum: ["SHA-1", "SHA-256", "SHA-384", "SHA-512"] }
+      },
+      required: ["publicKey", "publicKeyEncoding", "plaintext"],
+      additionalProperties: false
+    }),
+    defineTool("rsa_decrypt", "Decrypt with RSA private key (RSA-OAEP)", {
+      type: "object",
+      properties: {
+        privateKey: { type: "string" },
+        privateKeyEncoding: { type: "string", enum: ["base64", "hex", "pem"] },
+        ciphertext: { type: "string" },
+        inputEncoding: { type: "string", enum: ["base64", "hex"] },
+        outputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        hash: { type: "string", enum: ["SHA-1", "SHA-256", "SHA-384", "SHA-512"] }
+      },
+      required: ["privateKey", "ciphertext"],
+      additionalProperties: false
+    }),
+    defineTool("rsa_decrypt_direct", "Decrypt with explicit RSA private key parameters", {
+      type: "object",
+      properties: {
+        privateKey: { type: "string" },
+        privateKeyEncoding: { type: "string", enum: ["base64", "hex", "pem"] },
+        ciphertext: { type: "string" },
+        inputEncoding: { type: "string", enum: ["base64", "hex"] },
+        outputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        hash: { type: "string", enum: ["SHA-1", "SHA-256", "SHA-384", "SHA-512"] }
+      },
+      required: ["privateKey", "privateKeyEncoding", "ciphertext"],
+      additionalProperties: false
+    }),
+    defineTool("rsa_generate_keypair", "Generate RSA keypair and return base64/hex keys", {
+      type: "object",
+      properties: {
+        modulusLength: { type: "integer", enum: [1024, 2048, 3072, 4096] },
+        hash: { type: "string", enum: ["SHA-1", "SHA-256", "SHA-384", "SHA-512"] },
+        outputEncoding: { type: "string", enum: ["base64", "hex"] }
+      },
+      additionalProperties: false
+    }),
+    defineTool("encoding_convert", "Convert text between utf8/base64/hex/unicode encodings", {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        from: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        to: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] }
+      },
+      required: ["text", "from", "to"],
+      additionalProperties: false
+    }),
+    defineTool("http_request", "Send arbitrary HTTP request with method/headers/body/query", {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+        method: { type: "string" },
+        query: {
+          anyOf: [{ type: "object" }, { type: "string" }]
+        },
+        headers: {
+          anyOf: [{ type: "object" }, { type: "string" }]
+        },
+        body: {
+          anyOf: [{ type: "object" }, { type: "string" }, { type: "number" }, { type: "boolean" }]
+        },
+        bodyType: { type: "string", enum: ["auto", "json", "text"] },
+        timeoutSec: { type: "integer", minimum: 3, maximum: 300 },
+        responseType: { type: "string", enum: ["text", "json", "base64", "hex", "arraybuffer"] },
+        responseEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        includeResponseHeaders: { type: "boolean" },
+        maxResponseChars: { type: "integer", minimum: 512, maximum: 1000000 }
+      },
+      required: ["url"],
+      additionalProperties: false
+    }),
+    defineTool("random_uuid", "Generate random UUID v4", {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    }),
+    defineTool("random_uuid32", "Generate random UUID v4 without hyphens (32 chars)", {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    }),
+    defineTool("random_string", "Generate random string with given length and charset", {
+      type: "object",
+      properties: {
+        length: { type: "integer", minimum: 1, maximum: 4096 },
+        charset: { type: "string", enum: ["alnum", "alpha", "lower", "upper", "numeric", "hex", "base64", "base64url", "custom"] },
+        customChars: { type: "string", description: "Used when charset=custom or as direct charset source" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("random_number", "Generate random number in range", {
+      type: "object",
+      properties: {
+        min: { type: "number" },
+        max: { type: "number" },
+        integer: { type: "boolean", description: "default true" },
+        precision: { type: "integer", minimum: 0, maximum: 12, description: "only for float" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("click_element", "Click element by selector or text filter", {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        text: { type: "string" },
+        exact: { type: "boolean" },
+        all: { type: "boolean" },
+        index: { type: "integer", minimum: 0 },
+        visibleOnly: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("input_text", "Input text into input/textarea/contentEditable element", {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        text: { type: "string" },
+        append: { type: "boolean" },
+        all: { type: "boolean" },
+        index: { type: "integer", minimum: 0 }
+      },
+      required: ["selector", "text"],
+      additionalProperties: false
+    }),
+    defineTool("select_option", "Select option in select element by value/text/index", {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        value: { type: "string" },
+        text: { type: "string" },
+        optionIndex: { type: "integer", minimum: 0 },
+        all: { type: "boolean" },
+        index: { type: "integer", minimum: 0 }
+      },
+      required: ["selector"],
+      additionalProperties: false
+    }),
+    defineTool("scroll_to", "Scroll page to selector or coordinates", {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        top: { type: "number" },
+        left: { type: "number" },
+        behavior: { type: "string", enum: ["auto", "smooth"] }
+      },
+      additionalProperties: false
+    }),
+    defineTool("extract_table", "Extract table data", {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        maxTables: { type: "integer", minimum: 1, maximum: 20 },
+        maxRows: { type: "integer", minimum: 1, maximum: 500 }
+      },
+      additionalProperties: false
+    }),
+    defineTool("extract_form_schema", "Extract form schema and fields", {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        maxForms: { type: "integer", minimum: 1, maximum: 50 },
+        maxFields: { type: "integer", minimum: 1, maximum: 1000 },
+        includeHidden: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("extract_meta_tags", "Extract meta tags and canonical/title info", {
+      type: "object",
+      properties: {
+        includeOpenGraph: { type: "boolean" },
+        includeTwitter: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("extract_jsonld", "Extract JSON-LD scripts from page", {
+      type: "object",
+      properties: {
+        parse: { type: "boolean", description: "default true, parse JSON if possible" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("query_by_text", "Find elements by visible text", {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        selector: { type: "string" },
+        exact: { type: "boolean" },
+        ignoreCase: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 200 }
+      },
+      required: ["text"],
+      additionalProperties: false
+    }),
+    defineTool("hash_digest", "Compute hash digest: MD5/SHA1/SHA256/SHA512", {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        inputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        algorithm: { type: "string", enum: ["MD5", "SHA1", "SHA256", "SHA512"] },
+        outputEncoding: { type: "string", enum: ["hex", "base64"] }
+      },
+      required: ["text"],
+      additionalProperties: false
+    }),
+    defineTool("hmac_sign", "Compute HMAC signature: MD5/SHA1/SHA256/SHA512", {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        inputEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        key: { type: "string" },
+        keyEncoding: { type: "string", enum: ["utf8", "base64", "hex", "unicode"] },
+        algorithm: { type: "string", enum: ["MD5", "SHA1", "SHA256", "SHA512"] },
+        outputEncoding: { type: "string", enum: ["hex", "base64"] }
+      },
+      required: ["text", "key"],
+      additionalProperties: false
+    }),
+    defineTool("url_encode", "URL encode text", {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        component: { type: "boolean", description: "true=encodeURIComponent, false=encodeURI" }
+      },
+      required: ["text"],
+      additionalProperties: false
+    }),
+    defineTool("url_decode", "URL decode text", {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        component: { type: "boolean", description: "true=decodeURIComponent, false=decodeURI" },
+        plusAsSpace: { type: "boolean", description: "decode + as space before decoding" }
+      },
+      required: ["text"],
+      additionalProperties: false
+    }),
+    defineTool("jwt_decode", "Decode JWT header/payload without verifying signature", {
+      type: "object",
+      properties: {
+        token: { type: "string" }
+      },
+      required: ["token"],
+      additionalProperties: false
+    }),
+    defineTool("jsonpath_query", "Query JSON by JSONPath (supports $, .prop, [index], ['prop'], [*])", {
+      type: "object",
+      properties: {
+        json: {
+          anyOf: [{ type: "object" }, { type: "array" }, { type: "string" }]
+        },
+        path: { type: "string" },
+        firstOnly: { type: "boolean" }
+      },
+      required: ["json", "path"],
+      additionalProperties: false
+    }),
+    defineTool("regex_extract", "Extract by regex pattern", {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        pattern: { type: "string" },
+        flags: { type: "string" },
+        all: { type: "boolean" },
+        group: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 500 }
+      },
+      required: ["text", "pattern"],
+      additionalProperties: false
+    }),
+    defineTool("mcp_service_list", "List MCP services in current settings", {
+      type: "object",
+      properties: {
+        includeSecret: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("mcp_service_upsert", "Add or update MCP service by id/name and config", {
+      type: "object",
+      properties: {
+        serviceId: { type: "string" },
+        serviceName: { type: "string" },
+        id: { type: "string" },
+        name: { type: "string" },
+        enabled: { type: "boolean" },
+        transport: { type: "string", enum: ["streamable_http", "http", "sse", "stdio"] },
+        baseURL: { type: "string" },
+        apiKey: { type: "string" },
+        command: { type: "string" },
+        args: { type: "string" },
+        envText: { type: "string" },
+        service: { type: "object" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("mcp_service_set_enabled", "Enable/disable MCP service by id/name/index", {
+      type: "object",
+      properties: {
+        serviceId: { type: "string" },
+        serviceName: { type: "string" },
+        index: { type: "integer", minimum: 0 },
+        enabled: { type: "boolean" }
+      },
+      required: ["enabled"],
+      additionalProperties: false
+    }),
+    defineTool("mcp_service_test", "Test one MCP service and list available tool names", {
+      type: "object",
+      properties: {
+        serviceId: { type: "string" },
+        serviceName: { type: "string" },
+        index: { type: "integer", minimum: 0 },
+        service: { type: "object" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("crypto_profile_list", "List persisted crypto profiles", {
+      type: "object",
+      properties: {
+        includeSecret: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("crypto_profile_get", "Get persisted crypto profile by id/name/index", {
+      type: "object",
+      properties: {
+        profileId: { type: "string" },
+        profileName: { type: "string" },
+        id: { type: "string" },
+        name: { type: "string" },
+        index: { type: "integer", minimum: 0 },
+        includeSecret: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("crypto_profile_save", "Create or update persisted crypto profile", {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        name: { type: "string" },
+        algorithm: { type: "string", enum: ["AES", "DES", "DESede"] },
+        mode: { type: "string", enum: ["ECB", "CBC"] },
+        keySize: { type: "integer", enum: [64, 128, 192, 256] },
+        keyEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        keyValue: { type: "string" },
+        ivEncoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+        ivValue: { type: "string" },
+        description: { type: "string" }
+      },
+      required: ["name", "algorithm", "mode", "keyEncoding", "keyValue"],
+      additionalProperties: false
+    }),
+    defineTool("crypto_profile_delete", "Delete persisted crypto profile(s) by id/name/index, or bulk delete", {
+      type: "object",
+      properties: {
+        profileId: { type: "string" },
+        profileName: { type: "string" },
+        id: { type: "string" },
+        name: { type: "string" },
+        index: { type: "integer", minimum: 0 },
+        profileIds: { type: "array", items: { type: "string" } },
+        profileNames: { type: "array", items: { type: "string" } },
+        indexes: { type: "array", items: { type: "integer", minimum: 0 } },
+        query: { type: "string" },
+        all: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("crypto_profile_delete_many", "Alias of crypto_profile_delete for deleting multiple profiles", {
+      type: "object",
+      properties: {
+        profileId: { type: "string" },
+        profileName: { type: "string" },
+        id: { type: "string" },
+        name: { type: "string" },
+        index: { type: "integer", minimum: 0 },
+        profileIds: { type: "array", items: { type: "string" } },
+        profileNames: { type: "array", items: { type: "string" } },
+        indexes: { type: "array", items: { type: "integer", minimum: 0 } },
+        query: { type: "string" },
+        all: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
     defineTool("get_whole_html", "Get full page HTML", {
       type: "object",
       properties: {},
@@ -1370,6 +3525,87 @@ async function executeToolCall(call, ctx) {
       return setToolStorage(args);
     case "get_storage":
       return getToolStorage(args);
+    case "crypto_encrypt":
+      return toolCryptoEncrypt(args);
+    case "crypto_encrypt_direct":
+      return toolCryptoEncryptDirect(args);
+    case "crypto_decrypt":
+      return toolCryptoDecrypt(args);
+    case "crypto_decrypt_direct":
+      return toolCryptoDecryptDirect(args);
+    case "rsa_encrypt":
+      return toolRSAEncrypt(args);
+    case "rsa_encrypt_direct":
+      return toolRSAEncryptDirect(args);
+    case "rsa_decrypt":
+      return toolRSADecrypt(args);
+    case "rsa_decrypt_direct":
+      return toolRSADecryptDirect(args);
+    case "rsa_generate_keypair":
+      return toolRSAGenerateKeypair(args);
+    case "encoding_convert":
+      return toolEncodingConvert(args);
+    case "http_request":
+      return toolHttpRequest(args);
+    case "random_uuid":
+      return toolRandomUUID(args);
+    case "random_uuid32":
+      return toolRandomUUID32(args);
+    case "random_string":
+      return toolRandomString(args);
+    case "random_number":
+      return toolRandomNumber(args);
+    case "click_element":
+      return toolClickElement(ctx.tabId, args);
+    case "input_text":
+      return toolInputText(ctx.tabId, args);
+    case "select_option":
+      return toolSelectOption(ctx.tabId, args);
+    case "scroll_to":
+      return toolScrollTo(ctx.tabId, args);
+    case "extract_table":
+      return toolExtractTable(ctx.tabId, args);
+    case "extract_form_schema":
+      return toolExtractFormSchema(ctx.tabId, args);
+    case "extract_meta_tags":
+      return toolExtractMetaTags(ctx.tabId, args);
+    case "extract_jsonld":
+      return toolExtractJsonld(ctx.tabId, args);
+    case "query_by_text":
+      return toolQueryByText(ctx.tabId, args);
+    case "hash_digest":
+      return toolHashDigest(args);
+    case "hmac_sign":
+      return toolHmacSign(args);
+    case "url_encode":
+      return toolUrlEncode(args);
+    case "url_decode":
+      return toolUrlDecode(args);
+    case "jwt_decode":
+      return toolJwtDecode(args);
+    case "jsonpath_query":
+      return toolJsonpathQuery(args);
+    case "regex_extract":
+      return toolRegexExtract(args);
+    case "mcp_service_list":
+      return toolMcpServiceList(args);
+    case "mcp_service_upsert":
+      return toolMcpServiceUpsert(args);
+    case "mcp_service_set_enabled":
+      return toolMcpServiceSetEnabled(args);
+    case "mcp_service_test":
+      return toolMcpServiceTest(args);
+    case "crypto_profile_list":
+      return toolCryptoProfileList(args);
+    case "crypto_profile_get":
+      return toolCryptoProfileGet(args);
+    case "crypto_profile_save":
+      return toolCryptoProfileSave(args);
+    case "crypto_profile_delete":
+    case "crypto_profile_delete_many":
+    case "crypto_profile_remove":
+    case "crypto_delete_profile":
+      return toolCryptoProfileDelete(args);
     case "append_script":
       if (!ctx.settings.allowScript) {
         return { ok: false, error: "append_script disabled by settings" };
