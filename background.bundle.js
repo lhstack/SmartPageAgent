@@ -15032,6 +15032,327 @@ async function toolMcpServiceTest(args = {}) {
     toolNames: tools.map((t) => String(t?.name || "").trim()).filter(Boolean).slice(0, 200)
   };
 }
+async function waitTabComplete(tabId, timeoutMs = 15e3) {
+  const timeout = Math.max(1e3, Number(timeoutMs || 0));
+  try {
+    const current = await chrome.tabs.get(tabId);
+    if (current?.status === "complete") {
+      return { ok: true, timeout: false };
+    }
+  } catch (_err) {
+  }
+  return await new Promise((resolve) => {
+    let done = false;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+    };
+    const finish = (value) => {
+      cleanup();
+      resolve(value);
+    };
+    const onUpdated = (updatedTabId, info) => {
+      if (updatedTabId !== tabId) return;
+      if (info?.status === "complete") {
+        finish({ ok: true, timeout: false });
+      }
+    };
+    const onRemoved = (removedTabId) => {
+      if (removedTabId !== tabId) return;
+      finish({ ok: false, timeout: false, error: "tab was closed" });
+    };
+    const timer = setTimeout(() => {
+      finish({ ok: false, timeout: true, error: `tab load timeout after ${Math.ceil(timeout / 1e3)}s` });
+    }, timeout);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+  });
+}
+async function toolOpenURL(tabId, args = {}) {
+  const url = String(args.url || args.href || "").trim();
+  if (!url) return { ok: false, error: "url is required" };
+  let parsed = null;
+  try {
+    parsed = new URL(url);
+  } catch (_err) {
+    return { ok: false, error: "invalid url" };
+  }
+  const protocol = String(parsed.protocol || "").toLowerCase();
+  const allowProtocol = protocol === "http:" || protocol === "https:" || protocol === "file:" || protocol === "about:";
+  if (!allowProtocol) {
+    return { ok: false, error: `unsupported protocol: ${protocol}` };
+  }
+  const waitUntilComplete = args.waitUntilComplete !== false;
+  const timeoutSec = Number(args.timeoutSec || 20);
+  const timeoutMs = Math.max(1e3, Math.min(12e4, Number.isFinite(timeoutSec) ? timeoutSec * 1e3 : 2e4));
+  try {
+    await chrome.tabs.update(tabId, { url: parsed.toString() });
+    if (waitUntilComplete) {
+      const waitResult = await waitTabComplete(tabId, timeoutMs);
+      if (!waitResult.ok) {
+        return { ok: false, error: waitResult.error || "tab load failed", timeout: !!waitResult.timeout, url: parsed.toString() };
+      }
+    }
+    const current = await chrome.tabs.get(tabId);
+    return {
+      ok: true,
+      url: String(current?.url || parsed.toString()),
+      title: String(current?.title || ""),
+      status: String(current?.status || "")
+    };
+  } catch (err) {
+    return { ok: false, error: String(err || "open_url failed"), url: parsed.toString() };
+  }
+}
+async function sleepMs(ms) {
+  const wait = Math.max(0, Number(ms || 0));
+  if (!wait) return;
+  await new Promise((resolve) => setTimeout(resolve, wait));
+}
+async function toolWaitForElement(tabId, args = {}) {
+  const selector = String(args.selector || "").trim();
+  if (!selector) return { ok: false, error: "selector is required" };
+  const text = String(args.text || "").trim();
+  const exact = !!args.exact;
+  const visibleOnly = args.visibleOnly !== false;
+  const timeoutSecRaw = Number(args.timeoutSec || 15);
+  const timeoutSec = Math.max(1, Math.min(120, Number.isFinite(timeoutSecRaw) ? timeoutSecRaw : 15));
+  const intervalMsRaw = Number(args.intervalMs || 250);
+  const intervalMs = Math.max(50, Math.min(2e3, Number.isFinite(intervalMsRaw) ? intervalMsRaw : 250));
+  const start = Date.now();
+  const deadline = start + timeoutSec * 1e3;
+  let lastCount = 0;
+  while (Date.now() <= deadline) {
+    const result = await execOnTab(tabId, (sel, targetText, useExact, onlyVisible) => {
+      const normalize = (v) => String(v || "").replace(/\s+/g, " ").trim();
+      const isVisible = (el) => {
+        if (!onlyVisible) return true;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const getText = (el) => normalize(el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "");
+      const list = Array.from(document.querySelectorAll(sel)).filter((el) => {
+        if (!isVisible(el)) return false;
+        if (!targetText) return true;
+        const t = getText(el);
+        return useExact ? t === targetText : t.includes(targetText);
+      });
+      const first = list[0] || null;
+      return {
+        ok: true,
+        found: list.length > 0,
+        count: list.length,
+        first: first ? {
+          tag: String(first.tagName || "").toLowerCase(),
+          text: getText(first).slice(0, 240)
+        } : null
+      };
+    }, [selector, text, exact, visibleOnly]);
+    if (result?.ok && result.found) {
+      return {
+        ok: true,
+        selector,
+        count: Number(result.count || 0),
+        first: result.first || null,
+        elapsedMs: Date.now() - start
+      };
+    }
+    lastCount = Number(result?.count || 0);
+    await sleepMs(intervalMs);
+  }
+  return {
+    ok: false,
+    error: `wait_for_element timeout after ${timeoutSec}s`,
+    selector,
+    count: lastCount,
+    elapsedMs: Date.now() - start
+  };
+}
+async function toolAssertPageState(tabId, args = {}) {
+  const checks = Array.isArray(args.checks) ? args.checks : [];
+  if (checks.length === 0) {
+    return { ok: false, error: "checks is required and must be non-empty array" };
+  }
+  const normalizedChecks = checks.slice(0, 50).map((item) => item && typeof item === "object" ? item : {});
+  const pageInfo = await execOnTab(tabId, () => ({
+    ok: true,
+    url: location.href,
+    title: document.title || "",
+    bodyText: String(document.body?.innerText || "").slice(0, 3e5)
+  }));
+  const results = [];
+  for (const check of normalizedChecks) {
+    const type = String(check.type || "").trim().toLowerCase();
+    if (type === "selector") {
+      const selector = String(check.selector || "").trim();
+      if (!selector) {
+        results.push({ ok: false, type, error: "selector is required" });
+        continue;
+      }
+      const text = String(check.text || "").trim();
+      const exact = !!check.exact;
+      const visibleOnly = check.visibleOnly !== false;
+      const minCountRaw = Number(check.minCount);
+      const maxCountRaw = Number(check.maxCount);
+      const minCount = Number.isFinite(minCountRaw) ? Math.max(0, Math.floor(minCountRaw)) : 1;
+      const maxCount = Number.isFinite(maxCountRaw) ? Math.max(minCount, Math.floor(maxCountRaw)) : Number.POSITIVE_INFINITY;
+      const data = await execOnTab(tabId, (sel, targetText, useExact, onlyVisible) => {
+        const normalize = (v) => String(v || "").replace(/\s+/g, " ").trim();
+        const isVisible = (el) => {
+          if (!onlyVisible) return true;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+        const getText = (el) => normalize(el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "");
+        const list = Array.from(document.querySelectorAll(sel)).filter((el) => {
+          if (!isVisible(el)) return false;
+          if (!targetText) return true;
+          const t = getText(el);
+          return useExact ? t === targetText : t.includes(targetText);
+        });
+        return { ok: true, count: list.length };
+      }, [selector, text, exact, visibleOnly]);
+      const count = Number(data?.count || 0);
+      const pass = count >= minCount && count <= maxCount;
+      results.push({
+        ok: pass,
+        type,
+        selector,
+        count,
+        minCount,
+        maxCount: Number.isFinite(maxCount) ? maxCount : null
+      });
+      continue;
+    }
+    if (type === "url") {
+      const contains = String(check.contains || check.value || "").trim();
+      if (!contains) {
+        results.push({ ok: false, type, error: "contains is required" });
+        continue;
+      }
+      const current = String(pageInfo?.url || "");
+      results.push({ ok: current.includes(contains), type, contains, current });
+      continue;
+    }
+    if (type === "title") {
+      const contains = String(check.contains || check.value || "").trim();
+      if (!contains) {
+        results.push({ ok: false, type, error: "contains is required" });
+        continue;
+      }
+      const current = String(pageInfo?.title || "");
+      results.push({ ok: current.includes(contains), type, contains, current });
+      continue;
+    }
+    if (type === "page_text") {
+      const contains = String(check.contains || check.value || "").trim();
+      if (!contains) {
+        results.push({ ok: false, type, error: "contains is required" });
+        continue;
+      }
+      const current = String(pageInfo?.bodyText || "");
+      results.push({ ok: current.includes(contains), type, contains, matched: current.includes(contains) });
+      continue;
+    }
+    results.push({ ok: false, type, error: "unsupported check type, use selector/url/title/page_text" });
+  }
+  const passed = results.filter((item) => item.ok).length;
+  const failed = results.length - passed;
+  return {
+    ok: failed === 0,
+    passed,
+    failed,
+    total: results.length,
+    results
+  };
+}
+function toolToolList(args = {}, ctx = {}) {
+  const includeParameters = !!args.includeParameters;
+  const includeDescription = args.includeDescription !== false;
+  const all = buildToolSpecs(!!ctx?.settings?.allowScript, ctx?.mcpRegistry?.toolSpecs || []);
+  const tools = all.map((item) => {
+    const fn = item?.function || {};
+    const row = {
+      name: String(fn.name || ""),
+      source: String(fn.name || "").startsWith("mcp_") ? "mcp" : "local"
+    };
+    if (includeDescription) {
+      row.description = String(fn.description || "");
+    }
+    if (includeParameters) {
+      row.parameters = fn.parameters || {};
+    }
+    return row;
+  }).filter((item) => item.name);
+  return { ok: true, count: tools.length, tools };
+}
+async function toolBatchExecute(args = {}, ctx = {}) {
+  const steps = Array.isArray(args.steps) ? args.steps : [];
+  if (!steps.length) return { ok: false, error: "steps is required and must be non-empty array" };
+  const stopOnError = args.stopOnError !== false;
+  const maxStepsRaw = Number(args.maxSteps || 20);
+  const maxSteps = Math.max(1, Math.min(100, Number.isFinite(maxStepsRaw) ? Math.floor(maxStepsRaw) : 20));
+  const runList = steps.slice(0, maxSteps);
+  const results = [];
+  for (let i = 0; i < runList.length; i += 1) {
+    const step = runList[i] && typeof runList[i] === "object" ? runList[i] : {};
+    const name = String(step.name || step.tool || "").trim();
+    let stepArgs = {};
+    if (step.args && typeof step.args === "object") {
+      stepArgs = step.args;
+    } else if (typeof step.args === "string") {
+      try {
+        const parsed = JSON.parse(step.args);
+        if (parsed && typeof parsed === "object") {
+          stepArgs = parsed;
+        }
+      } catch (_err) {
+      }
+    }
+    if (!name) {
+      const bad = { ok: false, error: "step.name is required", index: i };
+      results.push({ index: i, name: "", result: bad });
+      if (stopOnError) break;
+      continue;
+    }
+    if (name === "batch_execute") {
+      const bad = { ok: false, error: "nested batch_execute is not allowed", index: i };
+      results.push({ index: i, name, result: bad });
+      if (stopOnError) break;
+      continue;
+    }
+    const call = {
+      id: `batch_${Date.now()}_${i}`,
+      function: {
+        name,
+        arguments: JSON.stringify(stepArgs || {})
+      }
+    };
+    const toolResult = await executeToolCall(call, {
+      ...ctx,
+      depth: Number(ctx?.depth || 0) + 1
+    });
+    results.push({ index: i, name, result: toolResult });
+    if (stopOnError && !toolResult?.ok) {
+      break;
+    }
+  }
+  const failed = results.filter((item) => !item?.result?.ok).length;
+  return {
+    ok: failed === 0,
+    total: runList.length,
+    executed: results.length,
+    failed,
+    results
+  };
+}
 async function toolClickElement(tabId, args = {}) {
   const selector = String(args.selector || "button,a,[role='button'],input[type='button'],input[type='submit']").trim();
   const text = String(args.text || "").trim();
@@ -16082,6 +16403,7 @@ function buildAgentSystemPrompt(allowScript, hasMCP, options = {}) {
     "3.5 \u9700\u8981\u8DE8\u8F6E\u6B21\u4FDD\u5B58\u6570\u636E\u65F6\u53EF\u7528 set_storage/get_storage\u3002",
     "3.6 \u52A0\u89E3\u5BC6/\u7F16\u89E3\u7801/\u7F51\u7EDC\u8BF7\u6C42\u8BF7\u4F18\u5148\u4F7F\u7528 crypto_*, rsa_*, encoding_convert, http_request \u5DE5\u5177\u3002",
     "3.7 \u9700\u8981\u4EA4\u4E92\u6216\u7ED3\u6784\u5316\u62BD\u53D6\u65F6\u4F18\u5148\u4F7F\u7528 click/input/select/scroll \u4EE5\u53CA extract_table/extract_form_schema/query_by_text/meta/jsonld \u5DE5\u5177\u3002",
+    "3.8 \u505A\u6D4B\u8BD5\u6D41\u7A0B\u65F6\uFF0C\u8BF7\u4F18\u5148\u7EC4\u5408 open_url + wait_for_element + assert_page_state + batch_execute\uFF0C\u6309\u76EE\u6807\u81EA\u52A8\u51B3\u7B56\u4E0B\u4E00\u6B65\u3002",
     allowScript ? "4. execute_script/append_script \u4EC5\u5728\u65E0\u5176\u4ED6\u5DE5\u5177\u53EF\u7528\u4E14\u7528\u6237\u660E\u786E\u8981\u6C42\u6267\u884C\u811A\u672C\u65F6\u624D\u80FD\u8C03\u7528\u3002" : "4. execute_script/append_script \u7981\u7528\uFF0C\u4E0D\u8981\u8C03\u7528\u3002",
     hasMCP ? "5. \u5141\u8BB8\u8C03\u7528 MCP \u5DE5\u5177\u8865\u5145\u80FD\u529B\u3002" : "5. \u5F53\u524D\u65E0 MCP \u5DE5\u5177\u3002",
     attachPageContext ? "6. \u672C\u8F6E\u5DF2\u9644\u5E26\u9875\u9762\u9884\u89C8\u4FE1\u606F\uFF0C\u4EC5\u5728\u4E0D\u8DB3\u65F6\u518D\u8C03\u7528 get_page_snapshot \u8865\u5145\u3002" : "6. \u672C\u8F6E\u672A\u9884\u8F7D\u9875\u9762\u5FEB\u7167\uFF0C\u9664\u975E\u4EFB\u52A1\u5FC5\u987B\u4F9D\u8D56\u9875\u9762\u4FE1\u606F\uFF0C\u5426\u5219\u4E0D\u8981\u8C03\u7528\u9875\u9762\u5DE5\u5177\u3002",
@@ -16402,6 +16724,84 @@ function buildToolSpecs(allowScript, mcpToolSpecs) {
         integer: { type: "boolean", description: "default true" },
         precision: { type: "integer", minimum: 0, maximum: 12, description: "only for float" }
       },
+      additionalProperties: false
+    }),
+    defineTool("tool_list", "List all available function calling tools", {
+      type: "object",
+      properties: {
+        includeDescription: { type: "boolean" },
+        includeParameters: { type: "boolean" }
+      },
+      additionalProperties: false
+    }),
+    defineTool("open_url", "Open URL in current tab", {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+        waitUntilComplete: { type: "boolean" },
+        timeoutSec: { type: "integer", minimum: 1, maximum: 120 }
+      },
+      required: ["url"],
+      additionalProperties: false
+    }),
+    defineTool("wait_for_element", "Wait until selector appears (optionally with text filter)", {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        text: { type: "string" },
+        exact: { type: "boolean" },
+        visibleOnly: { type: "boolean" },
+        timeoutSec: { type: "integer", minimum: 1, maximum: 120 },
+        intervalMs: { type: "integer", minimum: 50, maximum: 2e3 }
+      },
+      required: ["selector"],
+      additionalProperties: false
+    }),
+    defineTool("assert_page_state", "Assert page conditions for automation testing", {
+      type: "object",
+      properties: {
+        checks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["selector", "url", "title", "page_text"] },
+              selector: { type: "string" },
+              text: { type: "string" },
+              exact: { type: "boolean" },
+              visibleOnly: { type: "boolean" },
+              minCount: { type: "integer", minimum: 0 },
+              maxCount: { type: "integer", minimum: 0 },
+              contains: { type: "string" },
+              value: { type: "string" }
+            },
+            required: ["type"],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ["checks"],
+      additionalProperties: false
+    }),
+    defineTool("batch_execute", "Execute multiple tool calls in one request", {
+      type: "object",
+      properties: {
+        stopOnError: { type: "boolean" },
+        maxSteps: { type: "integer", minimum: 1, maximum: 100 },
+        steps: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              tool: { type: "string" },
+              args: { type: "object" }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      required: ["steps"],
       additionalProperties: false
     }),
     defineTool("click_element", "Click element by selector or text filter", {
@@ -16744,6 +17144,7 @@ function defineTool(name, description, parameters) {
 async function executeToolCall(call, ctx) {
   const name = call?.function?.name || "";
   const args = parseToolArgs(call?.function?.arguments || "{}");
+  const depth = Number(ctx?.depth || 0);
   switch (name) {
     case "get_page_snapshot":
       return collectPageSnapshot(ctx.tabId);
@@ -16801,6 +17202,19 @@ async function executeToolCall(call, ctx) {
       return toolRandomString(args);
     case "random_number":
       return toolRandomNumber(args);
+    case "tool_list":
+      return toolToolList(args, ctx);
+    case "open_url":
+      return toolOpenURL(ctx.tabId, args);
+    case "wait_for_element":
+      return toolWaitForElement(ctx.tabId, args);
+    case "assert_page_state":
+      return toolAssertPageState(ctx.tabId, args);
+    case "batch_execute":
+      if (depth >= 1) {
+        return { ok: false, error: "nested batch_execute is not allowed" };
+      }
+      return toolBatchExecute(args, { ...ctx, depth });
     case "click_element":
       return toolClickElement(ctx.tabId, args);
     case "input_text":

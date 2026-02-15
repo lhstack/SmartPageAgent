@@ -28,7 +28,7 @@
 - `extract_text`
 - `extract_links`
 - `extract_all_anchors`
-- `extract_buttons`
+- `extract_buttons_info`
 - `extract_elements_by_criteria`
 - `set_text`
 - `set_html`
@@ -45,6 +45,11 @@
 - `random_uuid` / `random_uuid32`
 - `random_string`（指定长度与字符集）
 - `random_number`（指定范围，支持整数/小数）
+- `tool_list`（列出当前可用 function calling 工具）
+- `open_url`（在当前标签页打开链接）
+- `wait_for_element`（等待元素出现/可见）
+- `assert_page_state`（页面断言，适合自动化测试）
+- `batch_execute`（批量执行多步工具调用）
 - `click_element` / `input_text` / `select_option` / `scroll_to`
 - `extract_table` / `extract_form_schema` / `extract_meta_tags` / `extract_jsonld`
 - `query_by_text`
@@ -108,6 +113,23 @@
 `random_number` 示例：  
 - `{"min":1,"max":100,"integer":true}`
 - `{"min":0,"max":1,"integer":false,"precision":6}`
+
+`tool_list` 示例：  
+- `{}`
+- `{"includeParameters":true}`
+
+`open_url` 示例：  
+- `{"url":"https://example.com","waitUntilComplete":true,"timeoutSec":20}`
+
+`wait_for_element` 示例：  
+- `{"selector":"form#login","timeoutSec":15}`
+- `{"selector":"button[type='submit']","text":"登录","visibleOnly":true,"timeoutSec":20}`
+
+`assert_page_state` 示例：  
+- `{"checks":[{"type":"url","contains":"example.com"},{"type":"selector","selector":"h1","minCount":1},{"type":"page_text","contains":"Welcome"}]}`
+
+`batch_execute` 示例：  
+- `{"stopOnError":true,"steps":[{"name":"open_url","args":{"url":"https://example.com/login"}},{"name":"wait_for_element","args":{"selector":"input[name='email']","timeoutSec":20}},{"name":"input_text","args":{"selector":"input[name='email']","text":"demo@example.com"}},{"name":"input_text","args":{"selector":"input[name='password']","text":"123456"}},{"name":"click_element","args":{"selector":"button[type='submit']"}},{"name":"assert_page_state","args":{"checks":[{"type":"url","contains":"dashboard"}]}}]}`
 
 `click_element` 示例：  
 - `{"selector":"button.submit"}`
