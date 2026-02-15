@@ -11,6 +11,9 @@
 - Function Calling 循环执行（多轮工具调用）
 - 页面操作工具（抓取 DOM、改属性、改文本、整页替换等）
 - 本地存储工具（`set_storage` / `get_storage`）
+- 加解密与编码工具（AES/DES/3DES、RSA、base64/hex/unicode）
+- 任意 HTTP 请求工具（方法/请求头/请求体/查询参数可配置）
+- 加密配置持久化工具（profile 保存/读取/删除）
 - MCP 多服务配置（可独立启用/关闭）
 
 ## 近期变更
@@ -33,6 +36,22 @@
 - `remove_elements`
 - `set_storage`（按 key 持久化存储 JSON 值）
 - `get_storage`（按 key 读取存储值）
+- `crypto_encrypt` / `crypto_decrypt`
+- `crypto_encrypt_direct` / `crypto_decrypt_direct`（显式参数，不使用 profile）
+- `rsa_encrypt` / `rsa_decrypt` / `rsa_generate_keypair`
+- `rsa_encrypt_direct` / `rsa_decrypt_direct`（显式参数）
+- `encoding_convert`（utf8/base64/hex/unicode 互转）
+- `http_request`（任意方法、headers、body、query）
+- `random_uuid` / `random_uuid32`
+- `random_string`（指定长度与字符集）
+- `random_number`（指定范围，支持整数/小数）
+- `click_element` / `input_text` / `select_option` / `scroll_to`
+- `extract_table` / `extract_form_schema` / `extract_meta_tags` / `extract_jsonld`
+- `query_by_text`
+- `hash_digest` / `hmac_sign`
+- `url_encode` / `url_decode` / `jwt_decode` / `jsonpath_query` / `regex_extract`
+- `mcp_service_list` / `mcp_service_upsert` / `mcp_service_set_enabled` / `mcp_service_test`
+- `crypto_profile_list` / `crypto_profile_get` / `crypto_profile_save` / `crypto_profile_delete`
 - `get_whole_html`
 - `replace_whole_html`
 - `translate_whole_page_to_zh`
@@ -45,6 +64,86 @@
 `set_storage/get_storage` 示例：  
 - `{"key":"profile","value":{"name":"lhstack","lang":"zh-CN"}}`  
 - `{"key":"profile"}`
+
+`crypto_profile_save` 示例：  
+- `{"name":"aes-ecb-demo","algorithm":"AES","mode":"ECB","keySize":128,"keyEncoding":"utf8","keyValue":"demo-key-123456","description":"测试配置"}`
+
+`crypto_encrypt` 示例（直接参数）：  
+- `{"algorithm":"AES","mode":"CBC","keySize":128,"keyEncoding":"utf8","key":"1234567890abcdef","ivEncoding":"utf8","iv":"abcdef1234567890","plaintext":"hello","outputEncoding":"base64"}`
+
+`crypto_encrypt` 示例（使用 profile）：  
+- `{"profileName":"aes-ecb-demo","plaintext":"hello","outputEncoding":"hex"}`
+
+`crypto_encrypt_direct` 示例（显式参数，不读取 profile）：  
+- `{"algorithm":"AES","mode":"ECB","keySize":128,"keyEncoding":"utf8","key":"demo-key-123456","plaintext":"hello","plainEncoding":"utf8","outputEncoding":"base64"}`
+
+`crypto_decrypt_direct` 示例（显式参数，不读取 profile）：  
+- `{"algorithm":"AES","mode":"ECB","keySize":128,"keyEncoding":"utf8","key":"demo-key-123456","ciphertext":"nHi0RPI6J2M6A5iJ5x8aNA==","cipherEncoding":"base64","outputEncoding":"utf8"}`
+
+`rsa_generate_keypair` 示例：  
+- `{"modulusLength":2048,"outputEncoding":"base64"}`
+
+`rsa_encrypt_direct` 示例：  
+- `{"publicKey":"<base64-spki-public-key>","publicKeyEncoding":"base64","plaintext":"hello","inputEncoding":"utf8","outputEncoding":"base64"}`
+
+`rsa_decrypt_direct` 示例：  
+- `{"privateKey":"<base64-pkcs8-private-key>","privateKeyEncoding":"base64","ciphertext":"<base64-ciphertext>","inputEncoding":"base64","outputEncoding":"utf8"}`
+
+`encoding_convert` 示例：  
+- `{"text":"你好","from":"utf8","to":"unicode"}`
+
+`http_request` 示例：  
+- `{"url":"https://httpbin.org/post","method":"POST","headers":{"Content-Type":"application/json"},"body":{"a":1},"bodyType":"json","responseType":"json"}`
+
+`random_uuid` 示例：  
+- `{}`
+
+`random_uuid32` 示例：  
+- `{}`
+
+`random_string` 示例：  
+- `{"length":24,"charset":"alnum"}`
+- `{"length":16,"charset":"custom","customChars":"ABC123xyz"}`
+
+`random_number` 示例：  
+- `{"min":1,"max":100,"integer":true}`
+- `{"min":0,"max":1,"integer":false,"precision":6}`
+
+`click_element` 示例：  
+- `{"selector":"button.submit"}`
+
+`input_text` 示例：  
+- `{"selector":"input[name='email']","text":"demo@example.com"}`
+
+`extract_table` 示例：  
+- `{"selector":"table","maxTables":3,"maxRows":50}`
+
+`query_by_text` 示例：  
+- `{"text":"登录","selector":"button,a,[role='button']","limit":10}`
+
+`hash_digest` 示例：  
+- `{"text":"hello","algorithm":"SHA256","outputEncoding":"hex"}`
+
+`hmac_sign` 示例：  
+- `{"text":"hello","key":"secret","algorithm":"SHA256","outputEncoding":"base64"}`
+
+`url_encode/url_decode` 示例：  
+- `{"text":"a b&c","component":true}`
+
+`jwt_decode` 示例：  
+- `{"token":"<jwt-token>"}`
+
+`jsonpath_query` 示例：  
+- `{"json":{"a":{"b":[{"id":1},{"id":2}]}},"path":"$.a.b[1].id"}`
+
+`regex_extract` 示例：  
+- `{"text":"id=123; id=456","pattern":"id=(\\\\d+)","flags":"g","all":true,"group":1}`
+
+`mcp_service_upsert` 示例（自动新增或更新）：  
+- `{"serviceName":"本地SSE","transport":"sse","baseURL":"http://127.0.0.1:8787/sse","apiKey":"xxx","enabled":true}`
+
+`mcp_service_test` 示例：  
+- `{"serviceName":"本地SSE"}`
 
 ## 快速开始
 

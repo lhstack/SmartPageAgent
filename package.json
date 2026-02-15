@@ -12,6 +12,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "crypto-js": "^4.2.0",
     "esbuild": "^0.27.3",
     "openai": "^6.22.0"
   }
