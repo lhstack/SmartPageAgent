@@ -29,6 +29,7 @@ const MODEL_LIST_TTL_MS = 30 * 1000;
 const DEFAULT_REQUEST_TIMEOUT_SEC = 120;
 const DEFAULT_TOOL_TURN_LIMIT = 0;
 const DEFAULT_THINKING_LEVEL = "auto";
+const MAX_PROMPT_DRAFT_CHARS = 12000;
 
 const state = {
   running: false,
@@ -462,10 +463,12 @@ function scheduleUICacheSave() {
 
 async function saveUICache() {
   try {
+    const promptDraft = String(promptInput?.value || "").slice(0, MAX_PROMPT_DRAFT_CHARS);
     const cache = {
       savedAt: Date.now(),
       models: state.models.slice(0, MAX_MODEL_CACHE),
       modelsUpdatedAt: state.modelsUpdatedAt || 0,
+      promptDraft,
       chat: collectChatHistoryFromDOM(),
     };
     await chrome.storage.local.set({ [UI_CACHE_KEY]: cache });
@@ -478,6 +481,10 @@ async function loadUICache() {
   try {
     const data = await chrome.storage.local.get(UI_CACHE_KEY);
     const cache = data?.[UI_CACHE_KEY] || {};
+    const draft = String(cache.promptDraft || "");
+    if (draft) {
+      promptInput.value = draft.slice(0, MAX_PROMPT_DRAFT_CHARS);
+    }
     if (Array.isArray(cache.models) && cache.models.length > 0) {
       updateModelList(cache.models, {
         persist: false,
@@ -1055,6 +1062,7 @@ async function runCommand() {
   resetStreamingNode();
   appendBubble(prompt, "user");
   promptInput.value = "";
+  scheduleUICacheSave();
 
   startAgentStream({
     type: "RUN_AGENT_STREAM",
@@ -1168,6 +1176,7 @@ function bindEvents() {
   clearBtn.addEventListener("click", async () => {
     chatLogNode.innerHTML = "";
     resetStreamingNode();
+    promptInput.value = "";
     updateSelectedModelHint();
     try {
       await chrome.storage.local.set({
@@ -1175,6 +1184,7 @@ function bindEvents() {
           savedAt: Date.now(),
           models: state.models.slice(0, MAX_MODEL_CACHE),
           modelsUpdatedAt: state.modelsUpdatedAt || 0,
+          promptDraft: "",
           chat: [],
         },
       });
@@ -1189,6 +1199,9 @@ function bindEvents() {
       event.preventDefault();
       await runCommand();
     }
+  });
+  promptInput.addEventListener("input", () => {
+    scheduleUICacheSave();
   });
 
   document.addEventListener("keydown", (event) => {
