@@ -488,6 +488,52 @@ label {
   grid-column: auto;
 }
 
+.mcp-header-panel {
+  border: 1px dashed #cfdbec;
+  border-radius: 8px;
+  padding: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.mcp-header-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #385574;
+}
+
+.mcp-header-list {
+  display: grid;
+  gap: 6px;
+}
+
+.mcp-header-row {
+  display: grid;
+  grid-template-columns: auto minmax(110px, 1fr) minmax(120px, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.mcp-header-enabled {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  min-width: 24px;
+}
+
+.mcp-header-row input[type="text"] {
+  min-width: 0;
+}
+
+.mcp-header-empty {
+  padding: 4px 0;
+}
+
 .danger-btn {
   border: 1px solid #e0b7b7;
   border-radius: 8px;

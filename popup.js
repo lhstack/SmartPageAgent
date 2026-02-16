@@ -526,16 +526,60 @@ function normalizeMcpTransport(value) {
   }
   return "streamable_http";
 }
+function normalizeMcpHeaderName(value) {
+  const name = String(value || "").trim();
+  if (!name) return "";
+  if (name.length > 128) return "";
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) return "";
+  return name;
+}
+function normalizeMcpHeaderValue(value) {
+  return String(value ?? "");
+}
+function normalizeMcpHeaders(input = [], legacyApiKey = "") {
+  const out = [];
+  const seen = new Set();
+  const pushOne = (rawName, rawValue, rawEnabled = true) => {
+    const name = normalizeMcpHeaderName(rawName);
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      name,
+      value: normalizeMcpHeaderValue(rawValue),
+      enabled: rawEnabled !== false,
+    });
+  };
+  if (Array.isArray(input)) {
+    input.forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      pushOne(item.name || item.key || item.header, item.value, item.enabled);
+    });
+  } else if (input && typeof input === "object") {
+    Object.entries(input).forEach(([name, value]) => pushOne(name, value, true));
+  }
+  const legacy = String(legacyApiKey || "");
+  if (legacy) {
+    const hasAuth = out.some((item) => String(item.name || "").toLowerCase() === "authorization");
+    if (!hasAuth) {
+      pushOne("Authorization", legacy, true);
+    }
+  }
+  return out;
+}
 
 function makeMcpService(input = {}) {
   const idSeed = Math.random().toString(36).slice(2, 8);
+  const legacyApiKey = String(input.apiKey || "");
+  const headersInput = Object.prototype.hasOwnProperty.call(input, "mcpHeaders") ? input.mcpHeaders : input.headers;
   return {
     id: String(input.id || `svc_${Date.now()}_${idSeed}`),
     name: String(input.name || ""),
     enabled: input.enabled !== false,
     transport: normalizeMcpTransport(input.transport),
     baseURL: String(input.baseURL || ""),
-    apiKey: String(input.apiKey || ""),
+    mcpHeaders: normalizeMcpHeaders(headersInput, legacyApiKey),
     command: String(input.command || ""),
     args: String(input.args || ""),
     envText: String(input.envText || ""),
@@ -567,6 +611,23 @@ function updateMcpService(id, patch) {
 function removeMcpService(id) {
   state.mcpServices = state.mcpServices.filter((item) => item.id !== id);
 }
+function collectMcpHeadersFromCard(node) {
+  if (!node) return [];
+  const out = [];
+  node.querySelectorAll(".mcp-header-row").forEach((row) => {
+    const nameInput = row.querySelector('[data-header-field="name"]');
+    const valueInput = row.querySelector('[data-header-field="value"]');
+    const enabledInput = row.querySelector('[data-header-field="enabled"]');
+    const name = normalizeMcpHeaderName(nameInput?.value);
+    if (!name) return;
+    out.push({
+      name,
+      value: normalizeMcpHeaderValue(valueInput?.value),
+      enabled: enabledInput?.checked !== false,
+    });
+  });
+  return normalizeMcpHeaders(out);
+}
 
 function escapeHTML(value) {
   return String(value || "")
@@ -575,6 +636,22 @@ function escapeHTML(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+function buildMcpHeaderRowsHTML(headers = []) {
+  const rows = Array.isArray(headers) ? headers : [];
+  if (rows.length === 0) {
+    return `<div class="tip mcp-header-empty">暂无 Header，点击“新增 Header”添加。</div>`;
+  }
+  return rows.map((item, idx) => `
+    <div class="mcp-header-row" data-header-index="${idx}">
+      <label class="mcp-header-enabled">
+        <input data-header-field="enabled" type="checkbox" ${item.enabled !== false ? "checked" : ""} />
+      </label>
+      <input data-header-field="name" type="text" placeholder="Header 名称，例如 Authorization" value="${escapeHTML(item.name)}" />
+      <input data-header-field="value" type="text" placeholder="Header 值" value="${escapeHTML(item.value)}" />
+      <button data-action="remove-header" type="button" class="mini-btn">删</button>
+    </div>
+  `).join("");
 }
 
 function buildMcpServiceCard(service) {
@@ -632,10 +709,15 @@ function buildMcpServiceCard(service) {
         ${baseURLLabel}
         <input data-field="baseURL" type="text" placeholder="${baseURLHint}" value="${escapeHTML(service.baseURL)}" />
       </label>
-      <label class="full-row">
-        Token（可选）
-        <input data-field="apiKey" type="password" placeholder="可选，用于 MCP 鉴权" value="${escapeHTML(service.apiKey)}" />
-      </label>
+      <div class="full-row mcp-header-panel">
+        <div class="mcp-header-head">
+          <span>自定义 Headers（可选）</span>
+          <button data-action="add-header" type="button" class="ghost-btn">新增 Header</button>
+        </div>
+        <div class="mcp-header-list">
+          ${buildMcpHeaderRowsHTML(service.mcpHeaders)}
+        </div>
+      </div>
       <label class="full-row ${stdioHiddenClass}" data-cmd-field="command">
         STDIO Command
         <input data-field="command" type="text" placeholder="例如：npx -y @modelcontextprotocol/server-filesystem ." value="${escapeHTML(service.command)}" />
@@ -677,6 +759,44 @@ function bindMcpServiceCard(node, serviceId) {
     };
     input.addEventListener("input", handler);
     input.addEventListener("change", handler);
+  });
+
+  const headerList = node.querySelector(".mcp-header-list");
+  const addHeaderBtn = node.querySelector('[data-action="add-header"]');
+  const syncHeaders = () => {
+    updateMcpService(serviceId, { mcpHeaders: collectMcpHeadersFromCard(node) });
+    scheduleSave();
+  };
+  if (addHeaderBtn && headerList) {
+    addHeaderBtn.addEventListener("click", () => {
+      const service = state.mcpServices[findServiceIndex(serviceId)];
+      const nextHeaders = Array.isArray(service?.mcpHeaders) ? [...service.mcpHeaders] : [];
+      nextHeaders.push({ name: "", value: "", enabled: true });
+      updateMcpService(serviceId, { mcpHeaders: nextHeaders });
+      renderMcpServices();
+      scheduleSave();
+    });
+  }
+  headerList?.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (target.getAttribute("data-action") !== "remove-header") return;
+    const row = target.closest(".mcp-header-row");
+    if (!row) return;
+    row.remove();
+    syncHeaders();
+  });
+  headerList?.addEventListener("input", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (!target.hasAttribute("data-header-field")) return;
+    syncHeaders();
+  });
+  headerList?.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (!target.hasAttribute("data-header-field")) return;
+    syncHeaders();
   });
 }
 

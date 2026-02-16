@@ -15013,7 +15013,7 @@ function pickMcpPayload(args = {}) {
     return args.service;
   }
   const out = {};
-  const fields = ["id", "name", "enabled", "transport", "baseURL", "apiKey", "command", "args", "envText"];
+  const fields = ["id", "name", "enabled", "transport", "baseURL", "apiKey", "mcpHeaders", "headers", "command", "args", "envText"];
   for (const field of fields) {
     if (Object.prototype.hasOwnProperty.call(args, field)) {
       out[field] = args[field];
@@ -15027,7 +15027,11 @@ async function toolMcpServiceList(args = {}) {
   const list = normalizeMcpServices(settings.mcpServices || []);
   const services = includeSecret ? list : list.map((item) => ({
     ...item,
-    apiKey: maskSecret(item.apiKey)
+    apiKey: maskSecret(item.apiKey),
+    mcpHeaders: Array.isArray(item.mcpHeaders) ? item.mcpHeaders.map((h) => ({
+      ...h,
+      value: maskSecret(h?.value)
+    })) : []
   }));
   return { ok: true, count: services.length, services };
 }
@@ -16077,14 +16081,84 @@ function normalizeMcpTransport(value) {
   }
   return "streamable_http";
 }
+function normalizeMcpHeaderName(value) {
+  const name = String(value || "").trim();
+  if (!name) return "";
+  if (name.length > 128) return "";
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) return "";
+  return name;
+}
+function normalizeMcpHeaderValue(value) {
+  return String(value ?? "");
+}
+function normalizeMcpHeaders(input, legacyApiKey = "") {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const pushOne = (rawName, rawValue, rawEnabled = true) => {
+    const name = normalizeMcpHeaderName(rawName);
+    if (!name) return;
+    const value = normalizeMcpHeaderValue(rawValue);
+    const enabled = rawEnabled !== false;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ name, value, enabled });
+  };
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!item || typeof item !== "object") continue;
+      pushOne(item.name || item.key || item.header, item.value, item.enabled);
+    }
+  } else if (input && typeof input === "object") {
+    for (const [name, value] of Object.entries(input)) {
+      pushOne(name, value, true);
+    }
+  } else if (typeof input === "string" && input.trim()) {
+    for (const line of input.split(/\r?\n/)) {
+      const row = line.trim();
+      if (!row) continue;
+      const sep = row.indexOf(":");
+      if (sep <= 0) continue;
+      pushOne(row.slice(0, sep), row.slice(sep + 1), true);
+    }
+  }
+  const legacy = String(legacyApiKey || "");
+  if (legacy) {
+    const hasAuth = out.some((item) => String(item.name || "").trim().toLowerCase() === "authorization");
+    if (!hasAuth) {
+      pushOne("Authorization", legacy, true);
+    }
+  }
+  return out;
+}
+function mcpHeadersToObject(service, extra = {}) {
+  const headers = {};
+  const list = Array.isArray(service?.mcpHeaders) ? service.mcpHeaders : normalizeMcpHeaders(service?.mcpHeaders, service?.apiKey);
+  for (const item of list) {
+    if (!item || item.enabled === false) continue;
+    const name = normalizeMcpHeaderName(item.name);
+    if (!name) continue;
+    headers[name] = normalizeMcpHeaderValue(item.value);
+  }
+  if (!headers.Authorization && String(service?.apiKey || "").trim()) {
+    headers.Authorization = String(service.apiKey);
+  }
+  if (extra.sessionId) {
+    headers["MCP-Session-Id"] = String(extra.sessionId);
+  }
+  return headers;
+}
 function normalizeMcpService(item = {}) {
+  const legacyApiKey = String(item.apiKey || "").trim();
+  const headersInput = Object.prototype.hasOwnProperty.call(item, "mcpHeaders") ? item.mcpHeaders : item.headers;
   return {
     id: String(item.id || createMcpServiceId()),
     name: String(item.name || "").trim(),
     enabled: item.enabled !== false,
     transport: normalizeMcpTransport(item.transport),
     baseURL: String(item.baseURL || "").trim().replace(/\/+$/, ""),
-    apiKey: String(item.apiKey || "").trim(),
+    apiKey: legacyApiKey,
+    mcpHeaders: normalizeMcpHeaders(headersInput, legacyApiKey),
     command: String(item.command || "").trim(),
     args: String(item.args || "").trim(),
     envText: String(item.envText || "")
@@ -16111,6 +16185,7 @@ function upgradeLegacyMcpSettings(input = {}) {
       transport: "http",
       baseURL: String(input.mcpBaseURL || "").trim(),
       apiKey: String(input.mcpApiKey || "").trim(),
+      mcpHeaders: normalizeMcpHeaders([], String(input.mcpApiKey || "").trim()),
       command: "",
       args: "",
       envText: ""
@@ -17098,6 +17173,37 @@ function buildToolSpecs(allowScript, mcpToolSpecs) {
         transport: { type: "string", enum: ["streamable_http", "http", "sse", "stdio"] },
         baseURL: { type: "string" },
         apiKey: { type: "string" },
+        mcpHeaders: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              value: { type: "string" },
+              enabled: { type: "boolean" }
+            },
+            required: ["name", "value"],
+            additionalProperties: false
+          }
+        },
+        headers: {
+          anyOf: [
+            {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  value: { type: "string" },
+                  enabled: { type: "boolean" }
+                },
+                required: ["name", "value"],
+                additionalProperties: false
+              }
+            },
+            { type: "object" }
+          ]
+        },
         command: { type: "string" },
         args: { type: "string" },
         envText: { type: "string" },
@@ -17974,6 +18080,7 @@ async function fetchMCPTools(settings) {
         transport: service.transport,
         baseURL: service.baseURL,
         apiKey: service.apiKey,
+        mcpHeaders: service.mcpHeaders,
         command: service.command,
         args: service.args,
         envText: service.envText,
@@ -18372,10 +18479,9 @@ function extractSessionIdFromURL(urlText) {
 }
 function buildSSEHeaders(service, extra = {}) {
   const headers = {
-    Accept: "text/event-stream, application/json"
+    Accept: "text/event-stream, application/json",
+    ...mcpHeadersToObject(service, { sessionId: extra.sessionId })
   };
-  if (service.apiKey) headers.Authorization = `Bearer ${service.apiKey}`;
-  if (extra.sessionId) headers["MCP-Session-Id"] = String(extra.sessionId);
   return headers;
 }
 async function openSSESession(service) {
@@ -18667,12 +18773,9 @@ async function callSSEMCP(service, method, params) {
 function buildMCPHeaders(service, extra = {}) {
   const headers = {
     "Content-Type": "application/json",
-    Accept: "application/json, text/event-stream"
+    Accept: "application/json, text/event-stream",
+    ...mcpHeadersToObject(service, { sessionId: extra.sessionId })
   };
-  if (service.apiKey) headers.Authorization = `Bearer ${service.apiKey}`;
-  if (extra.sessionId) {
-    headers["MCP-Session-Id"] = String(extra.sessionId);
-  }
   return headers;
 }
 function nextMcpRpcID() {

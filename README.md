@@ -175,7 +175,7 @@
 - `{"text":"id=123; id=456","pattern":"id=(\\\\d+)","flags":"g","all":true,"group":1}`
 
 `mcp_service_upsert` 示例（自动新增或更新）：  
-- `{"serviceName":"本地SSE","transport":"sse","baseURL":"http://127.0.0.1:8787/sse","apiKey":"xxx","enabled":true}`
+- `{"serviceName":"本地SSE","transport":"sse","baseURL":"http://127.0.0.1:8787/sse","mcpHeaders":[{"name":"Authorization","value":"Bearer xxx","enabled":true},{"name":"X-App-Id","value":"demo","enabled":true}],"enabled":true}`
 
 `mcp_service_test` 示例：  
 - `{"serviceName":"本地SSE"}`
@@ -233,5 +233,5 @@ npm run build:watch
 ## 安全提示
 
 - 开启 `execute_script` / `append_script` 后，模型可以在页面执行脚本，请仅在可信页面使用。
-- API Key、MCP Token、MCP 服务配置保存在 `chrome.storage.local`。
+- API Key、MCP 自定义 Headers、MCP 服务配置保存在 `chrome.storage.local`。
 - `chrome://` 等浏览器内部页面无法注入内容脚本。
